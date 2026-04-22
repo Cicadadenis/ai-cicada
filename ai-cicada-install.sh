@@ -213,15 +213,18 @@ show_logo() {
     press_any_key
 }
 
-get_system_ram_gb() {
-    local ram_gb=0
-    if command -v free >/dev/null 2>&1; then
-        ram_gb=$(free -g | awk '/^Mem:/{print $2}')
-    elif [ -f /proc/meminfo ]; then
-        ram_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
-        ram_gb=$((ram_kb / 1024 / 1024))
-    fi
-    echo "$ram_gb"
+draw_table_row() {
+    local col1="$1"
+    local col2="$2"
+    local col3="$3"
+    local col4="$4"
+    local col5="$5"
+    local color="${6:-$NC}"
+    printf "${color}| ${CYAN}%-18s${NC} | ${MAGENTA}%-8s${NC} | ${YELLOW}%-10s${NC} | ${GREEN}%-8s${NC} | %-17s |\n" "$col1" "$col2" "$col3" "$col4" "$col5"
+}
+
+draw_table_separator() {
+    printf "${NC}+--------------------+----------+------------+----------+-------------------+\n"
 }
 
 select_model() {
@@ -229,134 +232,52 @@ select_model() {
     center_text "${CYAN}Select Model:${NC}"
     printf "\n"
     
-    # Detect system RAM
-    local SYS_RAM=$(get_system_ram_gb)
-    local RAM_RECOMMEND=""
-    
-    printf "${YELLOW}Определено RAM: ~${SYS_RAM} GB${NC}\n"
-    printf "${YELLOW}Платформа: ${ENV_TYPE}${NC}\n\n"
-    
-    # Static table header
-    printf "${NC}┌────────────────────┬──────────┬────────────┬──────────┬───────────────────┐\n"
-    printf "│ ${CYAN}%-18s${NC} │ ${MAGENTA}%-8s${NC} │ ${YELLOW}%-10s${NC} │ ${GREEN}%-8s${NC} │ %-17s │\n" "Модель" "RAM" "Скорость" "Качество" "Применение"
-    printf "├────────────────────┼──────────┼────────────┼──────────┼───────────────────┤\n"
-    
-    local choice_num=0
-    local choices=()
-    
-    # Model definitions: name|ram|speed|quality|use|ollama_name
-    # Always show all models, but mark suitable ones
+    # Print table header
+    draw_table_separator
+    draw_table_row "Модель" "RAM" "Скорость" "Качество" "Лучшее применение" "$NC"
+    draw_table_separator
     
     if [ "$ENV_TYPE" = "homeassistant" ] || [ "$ENV_TYPE" = "wsl-ha" ]; then
-        # Home Assistant mode - 5 options
-        local models=(
-            "qwen2.5-coder 1.5B|2-4 GB|⚡⚡⚡⚡⚡⚡|⭐⭐⭐|код/HA|qwen2.5-coder:1.5b"
-            "qwen2.5-coder 3B|4-6 GB|🚀🚀🚀🚀🚀|⭐⭐⭐⭐|код (реком.)|qwen2.5-coder:3b"
-            "llama3.2 3B|4-6 GB|🚀🚀🚀🚀|⭐⭐⭐⭐|чат/логика|llama3.2:3b"
-            "phi3 mini|2-4 GB|⚡⚡⚡⚡⚡⚡|⭐⭐|слабые устр.|phi3:mini"
-            "mistral 7B|10-14 GB|⚖️|⭐⭐⭐⭐|мощь (медл.)|mistral:7b"
-        )
+        # Home Assistant optimized models
+        printf "${GREEN}1)${NC} "; draw_table_row "qwen2.5-coder 1.5B" "2-4 GB" "⚡⚡⚡⚡⚡⚡" "⭐⭐⭐" "код/HA рекоменд." "$NC"
+        printf "${GREEN}2)${NC} "; draw_table_row "qwen2.5-coder 3B" "4-6 GB" "🚀🚀🚀🚀🚀" "⭐⭐⭐⭐" "код (выбор)" "$NC"
+        printf "${GREEN}3)${NC} "; draw_table_row "llama3.2 3B" "4-6 GB" "🚀🚀🚀🚀" "⭐⭐⭐⭐" "чат/логика" "$NC"
+        printf "${GREEN}4)${NC} "; draw_table_row "phi3 mini" "2-4 GB" "⚡⚡⚡⚡⚡⚡" "⭐⭐" "слабые устр." "$NC"
+        printf "${GREEN}5)${NC} "; draw_table_row "mistral 7B" "10-14 GB" "⚖️" "⭐⭐⭐⭐" "мощь (медленно)" "$NC"
+        printf "${GREEN}6)${NC} "; draw_table_row "Вручную" "-" "-" "-" "другая модель" "$NC"
+        draw_table_separator
         
-        for model in "${models[@]}"; do
-            IFS='|' read -r name ram speed quality use ollama_name <<< "$model"
-            ((choice_num++))
-            choices[$choice_num]="$ollama_name"
-            
-            # Check if suitable for this system
-            local ram_min=$(echo "$ram" | cut -d'-' -f1 | tr -d ' GB')
-            local marker=""
-            local line_color="$NC"
-            
-            if [ "$SYS_RAM" -ge "$((ram_min + 2))" ] 2>/dev/null || [ "$ENV_TYPE" = "homeassistant" ]; then
-                marker="${GREEN}✓${NC} "
-                line_color="$GREEN"
-                if [ -z "$RAM_RECOMMEND" ]; then
-                    RAM_RECOMMEND="$choice_num"
-                fi
-            elif [ "$SYS_RAM" -ge "$ram_min" ] 2>/dev/null; then
-                marker="${YELLOW}~${NC} "
-                line_color="$YELLOW"
-            else
-                marker="${RED}✗${NC} "
-                line_color="$RED"
-            fi
-            
-            printf "${line_color}│${NC} ${marker}${CYAN}%-17s${NC} │ ${MAGENTA}%-8s${NC} │ ${YELLOW}%-10s${NC} │ ${GREEN}%-8s${NC} │ %-17s │\n" "$name" "$ram" "$speed" "$quality" "$use"
-        done
-        
-        # Manual input option
-        ((choice_num++))
-        choices[$choice_num]="MANUAL"
-        printf "│ ${GREEN}6)${NC} ${CYAN}%-17s${NC} │ ${MAGENTA}%-8s${NC} │ ${YELLOW}%-10s${NC} │ ${GREEN}%-8s${NC} │ %-17s │\n" "Вручную" "-" "-" "-" "другая модель"
-        
+        printf "\n${YELLOW}Выбор (1-6): ${NC}"
+        read -r choice </dev/tty
+        case $choice in
+            1) MODEL="qwen2.5-coder:1.5b" ;;
+            2) MODEL="qwen2.5-coder:3b" ;;
+            3) MODEL="llama3.2:3b" ;;
+            4) MODEL="phi3:mini" ;;
+            5) MODEL="mistral:7b" ;;
+            6) printf "${YELLOW}Enter model name: ${NC}"; read -r MODEL </dev/tty ;;
+            *) printf "${RED}Invalid choice${NC}\n"; sleep 2; select_model; return ;;
+        esac
     else
-        # Standard mode - 4 options
-        local models=(
-            "qwen2.5-coder 3B|4-6 GB|🚀🚀🚀🚀🚀|⭐⭐⭐⭐|код (реком.)|qwen2.5-coder:3b"
-            "llama3 8B|12-16 GB|🐢🐢|⭐⭐⭐⭐⭐|чат/логика|llama3:8b"
-            "mistral 7B|10-14 GB|⚖️|⭐⭐⭐⭐|универсал|mistral:7b"
-            "phi3 mini|2-4 GB|⚡⚡⚡⚡⚡⚡|⭐⭐|слабые устр.|phi3:mini"
-        )
+        # Standard models
+        printf "${GREEN}1)${NC} "; draw_table_row "qwen2.5-coder 3B" "4-6 GB" "🚀🚀🚀🚀🚀" "⭐⭐⭐⭐" "код (выбор)" "$NC"
+        printf "${GREEN}2)${NC} "; draw_table_row "llama3 8B" "12-16 GB" "🐢🐢" "⭐⭐⭐⭐⭐" "чат / логика" "$NC"
+        printf "${GREEN}3)${NC} "; draw_table_row "mistral 7B" "10-14 GB" "⚖️" "⭐⭐⭐⭐" "универсал" "$NC"
+        printf "${GREEN}4)${NC} "; draw_table_row "phi3 mini" "2-4 GB" "⚡⚡⚡⚡⚡⚡" "⭐⭐" "слабые устройства" "$NC"
+        printf "${GREEN}5)${NC} "; draw_table_row "Вручную" "-" "-" "-" "другая модель" "$NC"
+        draw_table_separator
         
-        for model in "${models[@]}"; do
-            IFS='|' read -r name ram speed quality use ollama_name <<< "$model"
-            ((choice_num++))
-            choices[$choice_num]="$ollama_name"
-            
-            # Check if suitable for this system
-            local ram_min=$(echo "$ram" | cut -d'-' -f1 | tr -d ' GB')
-            local marker=""
-            local line_color="$NC"
-            
-            if [ "$SYS_RAM" -ge "$((ram_min + 2))" ] 2>/dev/null; then
-                marker="${GREEN}✓${NC} "
-                line_color="$GREEN"
-                if [ -z "$RAM_RECOMMEND" ]; then
-                    RAM_RECOMMEND="$choice_num"
-                fi
-            elif [ "$SYS_RAM" -ge "$ram_min" ] 2>/dev/null; then
-                marker="${YELLOW}~${NC} "
-                line_color="$YELLOW"
-            else
-                marker="${RED}✗${NC} "
-                line_color="$RED"
-            fi
-            
-            printf "${line_color}│${NC} ${marker}${CYAN}%-17s${NC} │ ${MAGENTA}%-8s${NC} │ ${YELLOW}%-10s${NC} │ ${GREEN}%-8s${NC} │ %-17s │\n" "$name" "$ram" "$speed" "$quality" "$use"
-        done
-        
-        # Manual input option
-        ((choice_num++))
-        choices[$choice_num]="MANUAL"
-        printf "│ ${GREEN}5)${NC} ${CYAN}%-17s${NC} │ ${MAGENTA}%-8s${NC} │ ${YELLOW}%-10s${NC} │ ${GREEN}%-8s${NC} │ %-17s │\n" "Вручную" "-" "-" "-" "другая модель"
+        printf "\n${YELLOW}Выбор (1-5): ${NC}"
+        read -r choice </dev/tty
+        case $choice in
+            1) MODEL="qwen2.5-coder:3b" ;;
+            2) MODEL="llama3:8b" ;;
+            3) MODEL="mistral:7b" ;;
+            4) MODEL="phi3:mini" ;;
+            5) printf "${YELLOW}Enter model name: ${NC}"; read -r MODEL </dev/tty ;;
+            *) printf "${RED}Invalid choice${NC}\n"; sleep 2; select_model; return ;;
+        esac
     fi
-    
-    printf "└────────────────────┴──────────┴────────────┴──────────┴───────────────────┘\n"
-    
-    # Legend
-    printf "\n${GREEN}✓${NC} - идеально подходит  ${YELLOW}~${NC} - работает впритык  ${RED}✗${NC} - может не хватить RAM\n"
-    
-    if [ -n "$RAM_RECOMMEND" ]; then
-        printf "\n${GREEN}💡 Рекомендуется: выбор $RAM_RECOMMEND${NC}\n"
-    fi
-    
-    printf "\n${YELLOW}Ваш выбор (1-$choice_num): ${NC}"
-    read -r choice </dev/tty
-    
-    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$choice_num" ]; then
-        if [ "${choices[$choice]}" = "MANUAL" ]; then
-            printf "${YELLOW}Введите имя модели: ${NC}"
-            read -r MODEL </dev/tty
-        else
-            MODEL="${choices[$choice]}"
-        fi
-    else
-        printf "${RED}Неверный выбор${NC}\n"
-        sleep 2
-        select_model
-        return
-    fi
-    
     log "Selected model: $MODEL"
     printf "\n${GREEN}✓ Выбрана модель: $MODEL${NC}\n"
     sleep 1

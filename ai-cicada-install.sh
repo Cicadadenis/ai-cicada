@@ -378,6 +378,26 @@ install_sqlite_tools() {
     printf "${GREEN}SQLite tools ready${NC}\n"
 }
 
+install_python() {
+    if [ "$ENV_TYPE" != "termux" ]; then return; fi
+    printf "${BLUE}Checking Python3 (Termux)...${NC}\n"
+    if command -v python3 >/dev/null 2>&1; then
+        printf "${GREEN}Python3 already installed (%s)${NC}\n" "$(python3 --version 2>&1)"
+        return
+    fi
+    printf "${BLUE}Installing Python3...${NC}\n"
+    timer_start
+    (yes N | pkg install -y python >> "$LOG_FILE" 2>&1) &
+    spinner $!
+    timer_end
+    if command -v python3 >/dev/null 2>&1; then
+        printf "${GREEN}Python3 installed: %s${NC}\n" "$(python3 --version 2>&1)"
+    else
+        printf "${RED}Python3 installation failed. Check %s${NC}\n" "$LOG_FILE"
+        exit 1
+    fi
+}
+
 install_ollama() {
     printf "${BLUE}Checking Ollama...${NC}\n"
     if command -v ollama >/dev/null 2>&1; then
@@ -420,6 +440,10 @@ install_ollama() {
             ;;
         wsl)
             printf "${YELLOW}WSL detected: using standard Ollama installer...${NC}\n"
+            if ! command -v zstd >/dev/null 2>&1; then
+                printf "${BLUE}Installing zstd (required for Ollama extraction)...${NC}\n"
+                sudo DEBIAN_FRONTEND=noninteractive apt install -y zstd >> "$LOG_FILE" 2>&1
+            fi
             curl -fsSL https://ollama.com/install.sh | sh >> "$LOG_FILE" 2>&1 &
             spinner $!
             ;;
@@ -2224,6 +2248,7 @@ main() {
     update_system; clear
     install_nodejs; printf "\n"
     install_sqlite_tools; printf "\n"
+    install_python; printf "\n"
     install_ollama; printf "\n"
     start_ollama_service
     install_model; clear

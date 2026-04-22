@@ -213,29 +213,42 @@ show_logo() {
     press_any_key
 }
 
+draw_table_row() {
+    local col1="$1"
+    local col2="$2"
+    local col3="$3"
+    local col4="$4"
+    local col5="$5"
+    local color="${6:-$NC}"
+    printf "${color}| ${CYAN}%-18s${NC} | ${MAGENTA}%-8s${NC} | ${YELLOW}%-10s${NC} | ${GREEN}%-8s${NC} | %-17s |\n" "$col1" "$col2" "$col3" "$col4" "$col5"
+}
+
+draw_table_separator() {
+    printf "${NC}+--------------------+----------+------------+----------+-------------------+\n"
+}
+
 select_model() {
     clear
     center_text "${CYAN}Select Model:${NC}"
     printf "\n"
+    
+    # Print table header
+    draw_table_separator
+    draw_table_row "Модель" "RAM" "Скорость" "Качество" "Лучшее применение" "$NC"
+    draw_table_separator
+    
     if [ "$ENV_TYPE" = "homeassistant" ] || [ "$ENV_TYPE" = "wsl-ha" ]; then
-        draw_box \
-            "1) qwen2.5-coder:1.5b (HA - mало RAM)" \
-            "2) qwen2.5-coder:3b   (recommended)" \
-            "3) llama3.2:3b        (HA - баланс)" \
-            "4) phi3:mini          (лёгкая)" \
-            "5) mistral:7b         (мощная)" \
-            "6) Manual input"
-    else
-        draw_box \
-            "1) qwen2.5-coder:3b  (recommended)" \
-            "2) llama3:8b" \
-            "3) mistral:7b" \
-            "4) phi3:mini" \
-            "5) Manual input"
-    fi
-    printf "\n${YELLOW}Choice: ${NC}"
-    read -r choice </dev/tty
-    if [ "$ENV_TYPE" = "homeassistant" ] || [ "$ENV_TYPE" = "wsl-ha" ]; then
+        # Home Assistant optimized models
+        printf "${GREEN}1)${NC} "; draw_table_row "qwen2.5-coder 1.5B" "2-4 GB" "⚡⚡⚡⚡⚡⚡" "⭐⭐⭐" "код/HA рекоменд." "$NC"
+        printf "${GREEN}2)${NC} "; draw_table_row "qwen2.5-coder 3B" "4-6 GB" "🚀🚀🚀🚀🚀" "⭐⭐⭐⭐" "код (выбор)" "$NC"
+        printf "${GREEN}3)${NC} "; draw_table_row "llama3.2 3B" "4-6 GB" "🚀🚀🚀🚀" "⭐⭐⭐⭐" "чат/логика" "$NC"
+        printf "${GREEN}4)${NC} "; draw_table_row "phi3 mini" "2-4 GB" "⚡⚡⚡⚡⚡⚡" "⭐⭐" "слабые устр." "$NC"
+        printf "${GREEN}5)${NC} "; draw_table_row "mistral 7B" "10-14 GB" "⚖️" "⭐⭐⭐⭐" "мощь (медленно)" "$NC"
+        printf "${GREEN}6)${NC} "; draw_table_row "Вручную" "-" "-" "-" "другая модель" "$NC"
+        draw_table_separator
+        
+        printf "\n${YELLOW}Выбор (1-6): ${NC}"
+        read -r choice </dev/tty
         case $choice in
             1) MODEL="qwen2.5-coder:1.5b" ;;
             2) MODEL="qwen2.5-coder:3b" ;;
@@ -246,6 +259,16 @@ select_model() {
             *) printf "${RED}Invalid choice${NC}\n"; sleep 2; select_model; return ;;
         esac
     else
+        # Standard models
+        printf "${GREEN}1)${NC} "; draw_table_row "qwen2.5-coder 3B" "4-6 GB" "🚀🚀🚀🚀🚀" "⭐⭐⭐⭐" "код (выбор)" "$NC"
+        printf "${GREEN}2)${NC} "; draw_table_row "llama3 8B" "12-16 GB" "🐢🐢" "⭐⭐⭐⭐⭐" "чат / логика" "$NC"
+        printf "${GREEN}3)${NC} "; draw_table_row "mistral 7B" "10-14 GB" "⚖️" "⭐⭐⭐⭐" "универсал" "$NC"
+        printf "${GREEN}4)${NC} "; draw_table_row "phi3 mini" "2-4 GB" "⚡⚡⚡⚡⚡⚡" "⭐⭐" "слабые устройства" "$NC"
+        printf "${GREEN}5)${NC} "; draw_table_row "Вручную" "-" "-" "-" "другая модель" "$NC"
+        draw_table_separator
+        
+        printf "\n${YELLOW}Выбор (1-5): ${NC}"
+        read -r choice </dev/tty
         case $choice in
             1) MODEL="qwen2.5-coder:3b" ;;
             2) MODEL="llama3:8b" ;;
@@ -256,6 +279,8 @@ select_model() {
         esac
     fi
     log "Selected model: $MODEL"
+    printf "\n${GREEN}✓ Выбрана модель: $MODEL${NC}\n"
+    sleep 1
     clear
 }
 

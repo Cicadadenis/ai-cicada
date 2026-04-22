@@ -562,6 +562,7 @@ const https  = require('https');
 
 const PORT       = 3000;
 const MODEL      = process.env.AI_MODEL || 'qwen2.5-coder:3b';
+const OLLAMA_URL = process.env.OLLAMA_HOST || 'http://localhost:11434';
 const DB_PATH    = path.join(__dirname, 'cicada.db');
 let axios = null;
 try { axios = require('axios'); } catch(e) { console.log('axios not available, web search disabled'); }
@@ -968,7 +969,7 @@ const server = http.createServer(async function(req, res) {
     }
 
     if (req.method === 'GET' && url === '/model') {
-        return jsonOk(res, { model: MODEL, tools: Object.keys(TOOLS), web_search: !!axios });
+        return jsonOk(res, { model: MODEL, ollama_url: OLLAMA_URL, tools: Object.keys(TOOLS), web_search: !!axios });
     }
 
     /* Auth */
@@ -1120,8 +1121,11 @@ const server = http.createServer(async function(req, res) {
             }
 
             var payload = JSON.stringify({ model: MODEL, messages: messages, stream: true });
+            var ollamaHost = OLLAMA_URL.replace(/^https?:\/\//, '').split(':');
+            var ollamaHostname = ollamaHost[0];
+            var ollamaPort = parseInt(ollamaHost[1]) || 11434;
             var options = {
-                hostname: 'localhost', port: 11434, path: '/api/chat', method: 'POST',
+                hostname: ollamaHostname, port: ollamaPort, path: '/api/chat', method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) }
             };
 
@@ -2150,14 +2154,14 @@ web() {
     set +e
     if ! pgrep -x "ollama" > /dev/null 2>&1; then
         printf "Starting Ollama...\n"
-        ollama serve > /dev/null 2>&1 &
+        OLLAMA_ORIGINS='*' ollama serve > /dev/null 2>&1 &
         sleep 3
     fi
-    # Cross-platform IP detection (works on WSL, Termux, HA, Linux)
     CHAT_IP=\$(ip route get 1 2>/dev/null | awk '{for(i=1;i<=NF;i++)if(\$i=="src"){print \$(i+1);exit}}' || hostname -I 2>/dev/null | awk '{print \$1}' || echo "localhost")
-    printf "Web chat: http://\${CHAT_IP}:3000\n"
-    AI_MODEL=\$AI_MODEL node \$AI_CICADA_DIR/server.js || {
-        printf "Error: server crashed (exit \$?). Check logs.\n"
+    printf "Model  : \${AI_MODEL}\n"
+    printf "Web    : http://\${CHAT_IP}:3000\n"
+    OLLAMA_ORIGINS='*' AI_MODEL=\$AI_MODEL node \$AI_CICADA_DIR/server.js || {
+        printf "Error: server crashed. Check logs.\n"
     }
     set -e 2>/dev/null || true
 }

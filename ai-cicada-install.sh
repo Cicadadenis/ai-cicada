@@ -152,63 +152,64 @@ draw_box() {
 
 spinner() {
     local pid=$1
-    local spin='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
-    local i=0
+    local spin='|/-\\'
     while kill -0 "$pid" 2>/dev/null; do
-        local char="${spin:$i:1}"
-        printf "\r${CYAN}%s Обработка...${NC}" "$char"
-        i=$(( (i + 1) % 10 ))
+        local temp=${spin#?}
+        printf "\r${BLUE}[%c] Processing...${NC}" "$spin"
+        spin=$temp${spin%"$temp"}
         sleep 0.1
     done
-    printf "\r%-40s\r" " "
+    printf "\r%-30s\r" " "
 }
 
 timer_start() { START=$(date +%s); }
 timer_end() {
     END=$(date +%s)
-    printf "${DIM}  ⏱  Время: %d сек${NC}\n" "$((END - START))"
+    printf "${GREEN}Time: %d sec${NC}\n" "$((END - START))"
 }
 
 show_logo() {
     clear
+    printf "${MAGENTA}\n"
+    center_text "  ####   ####  "
+    center_text "  ## ##   ##   "
+    center_text "  ####    ##   "
+    center_text "  ## ##   ##   "
+    center_text "  ## ##  ####  "
+    printf "\n"
+    center_text " ####  ####  ####  ####  ####  ####  "
+    center_text "##    ##    ##    ##  ## ##  ## ##  ##"
+    center_text "##    ####  ##    ###### ##  ## ##  ##"
+    center_text "##    ##    ##    ##  ## ##  ## ##  ##"
+    center_text " ####  ####  ####  ##  ## ####  ##  ##"
+    printf "${NC}\n"
     local w; w=$(safe_tput_cols)
     local line=""; local i=0
-    while [ $i -lt $w ]; do line="${line}═"; i=$(( i + 1 )); done
-
-    printf "\n${MAGENTA}%s${NC}\n" "$line"
-    printf "${MAGENTA}"
-    center_text "   ██████╗ ██╗      ██████╗██╗ ██████╗  █████╗ "
-    center_text "  ██╔═══██╗██║     ██╔════╝██║██╔════╝ ██╔══██╗"
-    center_text "  ███████║██║     ██║      ██║██║      ███████║"
-    center_text "  ██╔══██║██║     ██║      ██║██║      ██╔══██║"
-    center_text "  ██║  ██║██████╗  ██████╗██║ ╚██████╗ ██║  ██║"
-    center_text "  ╚═╝  ╚═╝╚═════╝  ╚═════╝╚═╝  ╚═════╝╚═╝  ╚═╝"
-    printf "${NC}\n"
-    printf "${CYAN}%s${NC}\n" "$line"
-
+    while [ $i -lt $w ]; do line="${line}-"; i=$(( i + 1 )); done
+    printf "${MAGENTA}%s${NC}\n\n" "$line"
+    center_text "${CYAN}* AI-CICADA INSTALLER v5.0 *${NC}"
     local display_env="$ENV_TYPE"
-    local env_icon="🖥"
     case "$ENV_TYPE" in
-        wsl|wsl-ha)      display_env="WSL (Windows)";     env_icon="🪟" ;;
-        homeassistant)   display_env="Home Assistant";    env_icon="🏠" ;;
-        termux)          display_env="Termux (Android)";  env_icon="📱" ;;
-        debian)          display_env="Debian/Ubuntu";     env_icon="🐧" ;;
-        fedora)          display_env="Fedora";            env_icon="🎩" ;;
-        arch)            display_env="Arch Linux";        env_icon="🔷" ;;
-        alpine)          display_env="Alpine Linux";      env_icon="🏔" ;;
-        opensuse)        display_env="openSUSE";          env_icon="🦎" ;;
-        void)            display_env="Void Linux";        env_icon="⚫" ;;
+        wsl|wsl-ha) display_env="WSL (Windows)" ;;
+        homeassistant) display_env="Home Assistant" ;;
+        termux) display_env="Termux (Android)" ;;
+        debian) display_env="Debian/Ubuntu" ;;
+        fedora) display_env="Fedora" ;;
+        arch) display_env="Arch Linux" ;;
+        alpine) display_env="Alpine Linux" ;;
+        opensuse) display_env="openSUSE" ;;
+        void) display_env="Void Linux" ;;
     esac
-
-    printf "\n"
-    center_text "${YELLOW}★  AI-CICADA УСТАНОВЩИК v5.0  ★${NC}"
-    center_text "${GREEN}${env_icon}  Платформа: ${CYAN}${display_env}${NC}"
+    center_text "${YELLOW}Platform: ${display_env}${NC}"
     if [ "$ENV_TYPE" = "homeassistant" ] || [ "$ENV_TYPE" = "wsl-ha" ]; then
-        center_text "${GREEN}📁 Данные: /config/.ai-cicada${NC}"
+        printf "\n"
+        center_text "${GREEN}[Home Assistant mode] /config/.ai-cicada${NC}"
     fi
     printf "\n"
-    printf "${MAGENTA}%s${NC}\n\n" "$line"
-    center_text "${DIM}Нажми Enter для продолжения...${NC}"
+    local w2; w2=$(safe_tput_cols)
+    local line2=""; local j=0
+    while [ $j -lt $w2 ]; do line2="${line2}-"; j=$(( j + 1 )); done
+    printf "${MAGENTA}%s${NC}\n\n" "$line2"
     press_any_key
 }
 
@@ -228,26 +229,25 @@ draw_table_separator() {
 
 select_model() {
     clear
-    local w; w=$(safe_tput_cols)
-    local line=""; local i=0
-    while [ $i -lt $w ]; do line="${line}─"; i=$(( i + 1 )); done
-    printf "${CYAN}%s${NC}\n" "$line"
-    center_text "${MAGENTA}🤖  ВЫБОР МОДЕЛИ  🤖${NC}"
-    printf "${CYAN}%s${NC}\n\n" "$line"
-
+    center_text "${CYAN}Select Model:${NC}"
+    printf "\n"
+    
+    # Print table header
     draw_table_separator
     draw_table_row "Модель" "RAM" "Скорость" "Качество" "Лучшее применение" "$NC"
     draw_table_separator
-
+    
     if [ "$ENV_TYPE" = "homeassistant" ] || [ "$ENV_TYPE" = "wsl-ha" ]; then
-        printf "${GREEN} 1)${NC} "; draw_table_row "qwen2.5-coder 1.5B" "2-4 ГБ" "⚡⚡⚡⚡⚡⚡" "⭐⭐⭐" "код / HA рекоменд."
-        printf "${GREEN} 2)${NC} "; draw_table_row "qwen2.5-coder 3B"   "4-6 ГБ" "🚀🚀🚀🚀🚀" "⭐⭐⭐⭐" "код (лучший выбор)"
-        printf "${GREEN} 3)${NC} "; draw_table_row "llama3.2 3B"        "4-6 ГБ" "🚀🚀🚀🚀"   "⭐⭐⭐⭐" "чат / логика"
-        printf "${GREEN} 4)${NC} "; draw_table_row "phi3 mini"          "2-4 ГБ" "⚡⚡⚡⚡⚡⚡" "⭐⭐"   "слабые устройства"
-        printf "${GREEN} 5)${NC} "; draw_table_row "mistral 7B"         "10-14 ГБ" "⚖️ "       "⭐⭐⭐⭐" "мощь (медленно)"
-        printf "${GREEN} 6)${NC} "; draw_table_row "✏  Вручную"         "-"       "-"          "-"     "другая модель"
+        # Home Assistant optimized models
+        printf "${GREEN}1)${NC} "; draw_table_row "qwen2.5-coder 1.5B" "2-4 GB" "⚡⚡⚡⚡⚡⚡" "⭐⭐⭐" "код/HA рекоменд." "$NC"
+        printf "${GREEN}2)${NC} "; draw_table_row "qwen2.5-coder 3B" "4-6 GB" "🚀🚀🚀🚀🚀" "⭐⭐⭐⭐" "код (выбор)" "$NC"
+        printf "${GREEN}3)${NC} "; draw_table_row "llama3.2 3B" "4-6 GB" "🚀🚀🚀🚀" "⭐⭐⭐⭐" "чат/логика" "$NC"
+        printf "${GREEN}4)${NC} "; draw_table_row "phi3 mini" "2-4 GB" "⚡⚡⚡⚡⚡⚡" "⭐⭐" "слабые устр." "$NC"
+        printf "${GREEN}5)${NC} "; draw_table_row "mistral 7B" "10-14 GB" "⚖️" "⭐⭐⭐⭐" "мощь (медленно)" "$NC"
+        printf "${GREEN}6)${NC} "; draw_table_row "Вручную" "-" "-" "-" "другая модель" "$NC"
         draw_table_separator
-        printf "\n${YELLOW}  Ваш выбор (1-6): ${NC}"
+        
+        printf "\n${YELLOW}Выбор (1-6): ${NC}"
         read -r choice </dev/tty
         case $choice in
             1) MODEL="qwen2.5-coder:1.5b" ;;
@@ -255,35 +255,36 @@ select_model() {
             3) MODEL="llama3.2:3b" ;;
             4) MODEL="phi3:mini" ;;
             5) MODEL="mistral:7b" ;;
-            6) printf "${YELLOW}  Введите название модели: ${NC}"; read -r MODEL </dev/tty ;;
-            *) printf "${RED}  ✗ Неверный выбор${NC}\n"; sleep 2; select_model; return ;;
+            6) printf "${YELLOW}Enter model name: ${NC}"; read -r MODEL </dev/tty ;;
+            *) printf "${RED}Invalid choice${NC}\n"; sleep 2; select_model; return ;;
         esac
     else
-        printf "${GREEN} 1)${NC} "; draw_table_row "qwen2.5-coder 3B" "4-6 ГБ"   "🚀🚀🚀🚀🚀" "⭐⭐⭐⭐" "код (лучший выбор)"
-        printf "${GREEN} 2)${NC} "; draw_table_row "llama3 8B"        "12-16 ГБ" "🐢🐢"       "⭐⭐⭐⭐⭐" "чат / логика"
-        printf "${GREEN} 3)${NC} "; draw_table_row "mistral 7B"       "10-14 ГБ" "⚖️ "        "⭐⭐⭐⭐" "универсальная"
-        printf "${GREEN} 4)${NC} "; draw_table_row "phi3 mini"        "2-4 ГБ"   "⚡⚡⚡⚡⚡⚡" "⭐⭐"   "слабые устройства"
-        printf "${GREEN} 5)${NC} "; draw_table_row "✏  Вручную"       "-"        "-"          "-"     "другая модель"
+        # Standard models
+        printf "${GREEN}1)${NC} "; draw_table_row "qwen2.5-coder 3B" "4-6 GB" "🚀🚀🚀🚀🚀" "⭐⭐⭐⭐" "код (выбор)" "$NC"
+        printf "${GREEN}2)${NC} "; draw_table_row "llama3 8B" "12-16 GB" "🐢🐢" "⭐⭐⭐⭐⭐" "чат / логика" "$NC"
+        printf "${GREEN}3)${NC} "; draw_table_row "mistral 7B" "10-14 GB" "⚖️" "⭐⭐⭐⭐" "универсал" "$NC"
+        printf "${GREEN}4)${NC} "; draw_table_row "phi3 mini" "2-4 GB" "⚡⚡⚡⚡⚡⚡" "⭐⭐" "слабые устройства" "$NC"
+        printf "${GREEN}5)${NC} "; draw_table_row "Вручную" "-" "-" "-" "другая модель" "$NC"
         draw_table_separator
-        printf "\n${YELLOW}  Ваш выбор (1-5): ${NC}"
+        
+        printf "\n${YELLOW}Выбор (1-5): ${NC}"
         read -r choice </dev/tty
         case $choice in
             1) MODEL="qwen2.5-coder:3b" ;;
             2) MODEL="llama3:8b" ;;
             3) MODEL="mistral:7b" ;;
             4) MODEL="phi3:mini" ;;
-            5) printf "${YELLOW}  Введите название модели: ${NC}"; read -r MODEL </dev/tty ;;
-            *) printf "${RED}  ✗ Неверный выбор${NC}\n"; sleep 2; select_model; return ;;
+            5) printf "${YELLOW}Enter model name: ${NC}"; read -r MODEL </dev/tty ;;
+            *) printf "${RED}Invalid choice${NC}\n"; sleep 2; select_model; return ;;
         esac
     fi
     log "Selected model: $MODEL"
-    printf "\n${GREEN}  ✓ Выбрана модель: ${CYAN}$MODEL${NC}\n"
+    printf "\n${GREEN}✓ Выбрана модель: $MODEL${NC}\n"
     sleep 1
     clear
 }
 
 fix_dpkg_termux() {
-    printf "${YELLOW}🔧 Исправление dpkg...${NC}\n"
     echo N | dpkg --configure -a >> "$LOG_FILE" 2>&1 || true
 }
 
@@ -293,7 +294,7 @@ update_system() {
     case $ENV_TYPE in
         termux)
             fix_dpkg_termux
-            (yes N | pkg update -y 2>>"$LOG_FILE" && yes N | pkg upgrade -y 2>>"$LOG_FILE") &
+            (yes N | pkg update -y >> "$LOG_FILE" 2>&1 && yes N | pkg upgrade -y >> "$LOG_FILE" 2>&1) &
             spinner $!
             ;;
         debian|wsl)
@@ -332,16 +333,16 @@ update_system() {
 }
 
 install_nodejs() {
-    printf "${BLUE}🔍 Проверка Node.js...${NC}\n"
+    printf "${BLUE}Checking Node.js...${NC}\n"
     if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
         local ver; ver=$(node --version 2>/dev/null)
-        printf "${GREEN}✓ Node.js уже установлен (%s)${NC}\n" "$ver"
+        printf "${GREEN}Node.js already installed (%s)${NC}\n" "$ver"
         return
     fi
-    printf "${BLUE}📦 Установка Node.js...${NC}\n"
+    printf "${BLUE}Installing Node.js...${NC}\n"
     timer_start
     case $ENV_TYPE in
-        termux)   (yes N | pkg install -y nodejs 2>>"$LOG_FILE") & spinner $! ;;
+        termux)   (yes N | pkg install -y nodejs >> "$LOG_FILE" 2>&1) & spinner $! ;;
         debian|wsl)   (sudo DEBIAN_FRONTEND=noninteractive apt install -y nodejs npm >> "$LOG_FILE" 2>&1) & spinner $! ;;
         fedora)   (sudo dnf install -y nodejs npm >> "$LOG_FILE" 2>&1) & spinner $! ;;
         arch)     (sudo pacman -S --noconfirm nodejs npm >> "$LOG_FILE" 2>&1) & spinner $! ;;
@@ -352,21 +353,21 @@ install_nodejs() {
     esac
     timer_end
     if command -v node >/dev/null 2>&1; then
-        printf "${GREEN}✓ Node.js установлен: %s${NC}\n" "$(node --version)"
+        printf "${GREEN}Node.js installed: %s${NC}\n" "$(node --version)"
     else
-        printf "${RED}✗ Ошибка установки Node.js. Check %s${NC}\n" "$LOG_FILE"
+        printf "${RED}Node.js installation failed. Check %s${NC}\n" "$LOG_FILE"
         exit 1
     fi
 }
 
 install_sqlite_tools() {
-    printf "${BLUE}🔍 Проверка SQLite...${NC}\n"
+    printf "${BLUE}Checking SQLite tools...${NC}\n"
     if command -v sqlite3 >/dev/null 2>&1; then
-        printf "${GREEN}✓ SQLite уже доступен${NC}\n"
+        printf "${GREEN}sqlite3 already available${NC}\n"
         return
     fi
     case $ENV_TYPE in
-        termux)   (yes N | pkg install -y sqlite 2>>"$LOG_FILE") & spinner $! ;;
+        termux)   (yes N | pkg install -y sqlite >> "$LOG_FILE" 2>&1) & spinner $! ;;
         debian|wsl)   (sudo apt install -y sqlite3 >> "$LOG_FILE" 2>&1) & spinner $! ;;
         fedora)   (sudo dnf install -y sqlite >> "$LOG_FILE" 2>&1) & spinner $! ;;
         arch)     (sudo pacman -S --noconfirm sqlite >> "$LOG_FILE" 2>&1) & spinner $! ;;
@@ -374,16 +375,16 @@ install_sqlite_tools() {
         opensuse) (sudo zypper install -y sqlite3 >> "$LOG_FILE" 2>&1) & spinner $! ;;
         void)     (sudo xbps-install -y sqlite >> "$LOG_FILE" 2>&1) & spinner $! ;;
     esac
-    printf "${GREEN}✓ SQLite готов${NC}\n"
+    printf "${GREEN}SQLite tools ready${NC}\n"
 }
 
 install_ollama() {
-    printf "${BLUE}🔍 Проверка Ollama...${NC}\n"
+    printf "${BLUE}Checking Ollama...${NC}\n"
     if command -v ollama >/dev/null 2>&1; then
-        printf "${GREEN}✓ Ollama уже установлен${NC}\n"
+        printf "${GREEN}Ollama already installed${NC}\n"
         return
     fi
-    printf "${BLUE}📦 Установка Ollama...${NC}\n"
+    printf "${BLUE}Installing Ollama...${NC}\n"
     timer_start
     case $ENV_TYPE in
         termux)
@@ -429,17 +430,17 @@ install_ollama() {
     esac
     timer_end
     if command -v ollama >/dev/null 2>&1; then
-        printf "${GREEN}✓ Ollama установлен${NC}\n"
+        printf "${GREEN}Ollama installed${NC}\n"
     else
-        printf "${RED}✗ Ошибка установки Ollama. Check %s${NC}\n" "$LOG_FILE"
+        printf "${RED}Ollama installation failed. Check %s${NC}\n" "$LOG_FILE"
         exit 1
     fi
 }
 
 start_ollama_service() {
-    printf "${BLUE}▶ Запуск службы Ollama...${NC}\n"
+    printf "${BLUE}Starting Ollama service...${NC}\n"
     if pgrep -x "ollama" > /dev/null 2>&1; then
-        printf "${GREEN}✓ Ollama уже запущен${NC}\n"
+        printf "${GREEN}Ollama already running${NC}\n"
         return
     fi
     case $ENV_TYPE in
@@ -468,16 +469,16 @@ start_ollama_service() {
             ;;
     esac
     sleep 3
-    printf "${GREEN}✓ Служба Ollama запущена${NC}\n"
+    printf "${GREEN}Ollama service started${NC}\n"
 }
 
 install_model() {
-    printf "${BLUE}🔍 Проверка модели: %s${NC}\n" "$MODEL"
+    printf "${BLUE}Checking model: %s${NC}\n" "$MODEL"
     if ollama list 2>/dev/null | grep -q "$MODEL"; then
-        printf "${GREEN}✓ Модель уже установлена${NC}\n"
+        printf "${GREEN}Model already installed${NC}\n"
         return
     fi
-    printf "${BLUE}⬇  Загрузка %s...${NC}\n" "$MODEL"
+    printf "${BLUE}Downloading %s...${NC}\n" "$MODEL"
     timer_start
     log "Downloading model: $MODEL"
     ollama pull "$MODEL" 2>&1 | while IFS= read -r line; do
@@ -489,7 +490,7 @@ install_model() {
     done
     printf "\n"
     timer_end
-    printf "${GREEN}✓ Модель %s установлена${NC}\n" "$MODEL"
+    printf "${GREEN}Model %s installed${NC}\n" "$MODEL"
 }
 
 install_npm_deps() {
@@ -521,7 +522,7 @@ PKGEOF
 
 # Записываем server.js через python3 чтобы избежать проблем с heredoc в ash/busybox
 create_server_js() {
-    printf "${BLUE}📝 Создание server.js...${NC}\n"
+    printf "${BLUE}Creating server.js...${NC}\n"
     python3 - "$CHAT_DIR/server.js" << 'PYEOF'
 import sys
 
@@ -2079,16 +2080,16 @@ PYEOF
 }
 
 create_web_chat() {
-    printf "${BLUE}🌐 Создание файлов веб-чата...${NC}\n"
+    printf "${BLUE}Creating web chat files...${NC}\n"
     mkdir -p "$CHAT_DIR"
     create_server_js
     create_index_html
-    printf "${GREEN}✓ Веб-чат создан в %s${NC}\n" "$CHAT_DIR"
+    printf "${GREEN}Web chat created in %s${NC}\n" "$CHAT_DIR"
     log "Web chat created"
 }
 
 setup_alias() {
-    printf "${BLUE}⚙  Настройка команд...${NC}\n"
+    printf "${BLUE}Setting up commands...${NC}\n"
     local SHELLRC="$HOME/.bashrc"
     if [ "$ENV_TYPE" = "homeassistant" ] || [ "$ENV_TYPE" = "alpine" ] || [ "$ENV_TYPE" = "wsl-ha" ]; then
         if [ -f "$HOME/.bashrc" ]; then SHELLRC="$HOME/.bashrc";
@@ -2114,19 +2115,13 @@ ai() {
 
 web() {
     if ! pgrep -x "ollama" > /dev/null 2>&1; then
-        printf "▶ Запуск Ollama...\n"
+        printf "Starting Ollama...\n"
         ollama serve > /dev/null 2>&1 &
         sleep 3
     fi
-    # Освободить порт если занят
-    _pid=\$(lsof -ti :3000 2>/dev/null || fuser 3000/tcp 2>/dev/null | tr -d ' ')
-    if [ -n "\$_pid" ]; then
-        printf "⚠ Порт 3000 занят (PID \$_pid), освобождаю...\n"
-        kill -9 \$_pid 2>/dev/null || true
-        sleep 1
-    fi
+    # Cross-platform IP detection (works on WSL, Termux, HA, Linux)
     CHAT_IP=\$(ip route get 1 2>/dev/null | awk '{for(i=1;i<=NF;i++)if(\$i=="src"){print \$(i+1);exit}}' || hostname -I 2>/dev/null | awk '{print \$1}' || echo "localhost")
-    printf "🌐 Веб-чат: http://\${CHAT_IP}:3000\n"
+    printf "Web chat: http://\${CHAT_IP}:3000\n"
     AI_MODEL=\$AI_MODEL node \$AI_CICADA_DIR/server.js
 }
 
@@ -2138,125 +2133,86 @@ aidb() {
 }
 # END AI-CICADA
 ALIASEOF
-    printf "${GREEN}✓ Команды готовы: 'ai', 'web', 'aidb'${NC}\n"
+    printf "${GREEN}Commands ready: 'ai', 'web', 'aidb'${NC}\n"
 }
 
 show_ha_tips() {
     if [ "$ENV_TYPE" != "homeassistant" ] && [ "$ENV_TYPE" != "wsl-ha" ]; then return; fi
     clear
-    local w; w=$(safe_tput_cols)
-    local line=""; local i=0
-    while [ $i -lt $w ]; do line="${line}─"; i=$(( i + 1 )); done
-    printf "${GREEN}%s${NC}\n" "$line"
-    center_text "${GREEN}🏠  HOME ASSISTANT — СОВЕТЫ  🏠${NC}"
-    printf "${GREEN}%s${NC}\n\n" "$line"
-    center_text "${CYAN}📁 Данные:  ${YELLOW}/config/.ai-cicada/${NC}"
-    center_text "${CYAN}🗄  База:    ${YELLOW}/config/.ai-cicada/cicada.db${NC}"
-    center_text "${CYAN}🌐 Веб-чат: ${YELLOW}http://<IP-HA>:3000${NC}"
+    center_text "${GREEN}Home Assistant - советы${NC}"
     printf "\n"
-    center_text "${MAGENTA}▶ Автозапуск Ollama:${NC}"
-    center_text "${DIM}  ollama serve &${NC}"
+    draw_box \
+        "Данные: /config/.ai-cicada/" \
+        "БД:     /config/.ai-cicada/cicada.db" \
+        "" \
+        "Автозапуск Ollama:" \
+        "  ollama serve &" \
+        "" \
+        "Веб-чат: http://<HA-IP>:3000" \
+        "" \
+        "Просмотр БД: команда 'aidb'"
     printf "\n"
-    center_text "${MAGENTA}▶ Просмотр базы:${NC}"
-    center_text "${DIM}  команда 'aidb'${NC}"
-    printf "\n${GREEN}%s${NC}\n\n" "$line"
     press_any_key
 }
 
 final_screen() {
     clear
+    # Cross-platform IP detection
     local CHAT_HOST
     CHAT_HOST=$(ip route get 1 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="src"){print $(i+1);exit}}' || hostname -I 2>/dev/null | awk '{print $1}' || echo "localhost")
     local display_env="$ENV_TYPE"
-    local env_icon="🖥"
     case "$ENV_TYPE" in
-        wsl|wsl-ha)    display_env="WSL (Windows)";    env_icon="🪟" ;;
-        homeassistant) display_env="Home Assistant";   env_icon="🏠" ;;
-        termux)        display_env="Termux (Android)"; env_icon="📱" ;;
-        debian)        display_env="Debian/Ubuntu";    env_icon="🐧" ;;
-        fedora)        display_env="Fedora";           env_icon="🎩" ;;
-        arch)          display_env="Arch Linux";       env_icon="🔷" ;;
-        alpine)        display_env="Alpine Linux";     env_icon="🏔" ;;
-        opensuse)      display_env="openSUSE";         env_icon="🦎" ;;
-        void)          display_env="Void Linux";       env_icon="⚫" ;;
+        wsl|wsl-ha) display_env="WSL (Windows)" ;;
+        homeassistant) display_env="Home Assistant" ;;
+        termux) display_env="Termux (Android)" ;;
+        debian) display_env="Debian/Ubuntu" ;;
+        fedora) display_env="Fedora" ;;
+        arch) display_env="Arch Linux" ;;
+        alpine) display_env="Alpine Linux" ;;
+        opensuse) display_env="openSUSE" ;;
+        void) display_env="Void Linux" ;;
     esac
-    local w; w=$(safe_tput_cols)
-    local line=""; local i=0
-    while [ $i -lt $w ]; do line="${line}═"; i=$(( i + 1 )); done
-    printf "${GREEN}%s${NC}\n" "$line"
-    center_text "${GREEN}✅  УСТАНОВКА ЗАВЕРШЕНА  ✅${NC}"
-    printf "${GREEN}%s${NC}\n\n" "$line"
-    center_text "${env_icon}  ${CYAN}Платформа: ${YELLOW}${display_env}${NC}"
-    center_text "${GREEN}🤖 Модель:   ${YELLOW}${MODEL}${NC}"
-    center_text "${GREEN}🗄  База:     ${YELLOW}${CHAT_DIR}/cicada.db${NC}"
-    center_text "${GREEN}🔧 Функции:  ${CYAN}+Инструменты +Память +Веб-поиск${NC}"
+    draw_box \
+        "INSTALLATION COMPLETE" \
+        "" \
+        "Platform : $display_env" \
+        "Model    : $MODEL" \
+        "DB       : $CHAT_DIR/cicada.db" \
+        "Features : +Tools +Memory +WebSearch" \
+        "" \
+        "  web   -- http://${CHAT_HOST}:3000" \
+        "  ai    -- terminal agent" \
+        "  aidb  -- view database" \
+        "" \
+        "Log: $LOG_FILE"
     printf "\n"
-    printf "${CYAN}%s${NC}\n" "$line"
-    center_text "${MAGENTA}📌 КОМАНДЫ:${NC}"
-    printf "\n"
-    center_text "  ${GREEN}web${NC}   →  ${YELLOW}http://${CHAT_HOST}:3000${NC}  ${DIM}(браузерный чат)${NC}"
-    center_text "  ${GREEN}ai${NC}    →  ${YELLOW}терминальный агент${NC}"
-    center_text "  ${GREEN}aidb${NC}  →  ${YELLOW}просмотр базы данных${NC}"
-    printf "\n"
-    center_text "${DIM}Лог: ${LOG_FILE}${NC}"
-    printf "\n${CYAN}%s${NC}\n\n" "$line"
-    center_text "${YELLOW}⚡ Перезапусти терминал или выполни: ${CYAN}source ~/.bashrc${NC}"
+    center_text "${CYAN}Restart terminal or: source ~/.bashrc${NC}"
     printf "\n"
     press_any_key
 }
 
-kill_port() {
-    local port="${1:-3000}"
-    local pid
-    pid=$(lsof -ti ":$port" 2>/dev/null || fuser "$port/tcp" 2>/dev/null | tr -d ' ')
-    if [ -n "$pid" ]; then
-        printf "${YELLOW}⚠  Порт $port занят (PID $pid), освобождаю...${NC}\n"
-        kill -9 $pid 2>/dev/null || true
-        sleep 1
-        printf "${GREEN}✓ Порт $port свободен${NC}\n"
-    fi
-}
-
 launch_choice() {
     clear
-    printf "${MAGENTA}"
-    center_text "╔══════════════════════════════════════════╗"
-    center_text "║         ЧТО ЗАПУСТИТЬ СЕЙЧАС?           ║"
-    center_text "╚══════════════════════════════════════════╝"
-    printf "${NC}\n"
-    center_text "${CYAN}  1)${GREEN}  🌐  Браузерный чат       ${YELLOW}(web)${NC}"
-    center_text "${CYAN}  2)${GREEN}  💻  Терминальный агент   ${YELLOW}(ai)${NC}"
-    center_text "${CYAN}  3)${RED}  ✖   Выйти${NC}"
+    center_text "${YELLOW}What to launch now?${NC}"
     printf "\n"
-    printf "%*s${YELLOW}Выбор: ${NC}" "$(( ($(safe_tput_cols) - 8) / 2 ))" ""
+    draw_box "1) Browser chat (web)" "2) Terminal agent (ai)" "3) Exit"
+    printf "\n${YELLOW}Choice: ${NC}"
     read -r ch </dev/tty
+    # Cross-platform IP detection
     local CHAT_HOST
     CHAT_HOST=$(ip route get 1 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="src"){print $(i+1);exit}}' || hostname -I 2>/dev/null | awk '{print $1}' || echo "localhost")
     case $ch in
         1)
-            kill_port 3000
-            if ! pgrep -x "ollama" > /dev/null 2>&1; then
-                printf "${BLUE}▶ Запуск Ollama...${NC}\n"
-                ollama serve >> "$LOG_FILE" 2>&1 & sleep 3
-            fi
-            printf "\n${GREEN}✓ Открой в браузере: ${CYAN}http://%s:3000${NC}\n" "$CHAT_HOST"
-            printf "${YELLOW}  Для остановки нажми Ctrl+C${NC}\n\n"
+            if ! pgrep -x "ollama" > /dev/null 2>&1; then ollama serve >> "$LOG_FILE" 2>&1 & sleep 3; fi
+            printf "${GREEN}Open: http://%s:3000${NC}\n" "$CHAT_HOST"
+            printf "${YELLOW}Press Ctrl+C to stop${NC}\n"
             AI_MODEL="$MODEL" node "$CHAT_DIR/server.js"
             ;;
         2)
-            if ! pgrep -x "ollama" > /dev/null 2>&1; then
-                printf "${BLUE}▶ Запуск Ollama...${NC}\n"
-                ollama serve >> "$LOG_FILE" 2>&1 & sleep 3
-            fi
-            if [ "$ENV_TYPE" = "termux" ] || ! command -v openclaude >/dev/null 2>&1; then
-                printf "${GREEN}▶ Терминальный чат (ollama run $MODEL)${NC}\n"
-                printf "${YELLOW}  Для выхода введи /bye${NC}\n\n"
-                ollama run "$MODEL"
-            else
-                CLAUDE_CODE_USE_OPENAI=1 OPENAI_BASE_URL=http://localhost:11434/v1 OPENAI_MODEL="$MODEL" openclaude
-            fi
+            if ! pgrep -x "ollama" > /dev/null 2>&1; then ollama serve >> "$LOG_FILE" 2>&1 & sleep 3; fi
+            CLAUDE_CODE_USE_OPENAI=1 OPENAI_BASE_URL=http://localhost:11434/v1 OPENAI_MODEL="$MODEL" openclaude
             ;;
-        *) printf "\n${GREEN}✓ Готово! Запусти 'ai' или 'web' в любое время.${NC}\n\n" ;;
+        *) printf "${GREEN}Done! Run 'ai' or 'web' anytime.${NC}\n" ;;
     esac
 }
 

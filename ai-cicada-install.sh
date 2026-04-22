@@ -13,8 +13,35 @@ BLUE='\033[0;34m'
 RED='\033[0;31m'
 NC='\033[0m'
 
+detect_wsl() {
+    # Check for WSL using multiple methods
+    if [ -f /proc/sys/kernel/osrelease ] && grep -qi "microsoft\|wsl" /proc/sys/kernel/osrelease 2>/dev/null; then
+        return 0
+    fi
+    if [ -f /proc/version ] && grep -qi "microsoft\|wsl" /proc/version 2>/dev/null; then
+        return 0
+    fi
+    if [ -n "$WSL_DISTRO_NAME" ] || [ -n "$WSLENV" ]; then
+        return 0
+    fi
+    return 1
+}
+
 detect_env() {
-    if [ -f /etc/hassio_supervisor ] || [ -f /etc/homeassistant ] || \
+    # WSL check first (can also have apt)
+    if detect_wsl; then
+        ENV_TYPE="wsl"
+        PKG_MANAGER="apt"
+        SUDO="sudo"
+        if [ -f /etc/hassio_supervisor ] || [ -d /config/custom_components ] 2>/dev/null; then
+            # WSL with Home Assistant
+            ENV_TYPE="wsl-ha"
+            PKG_MANAGER="apk"
+            SUDO=""
+            CHAT_DIR="/config/.ai-cicada"
+            LOG_FILE="/config/ai-cicada-install.log"
+        fi
+    elif [ -f /etc/hassio_supervisor ] || [ -f /etc/homeassistant ] || \
        [ -d /config/custom_components ] || \
        grep -qi "homeassistant\|hassio\|hassos" /proc/version 2>/dev/null || \
        grep -qi "homeassistant" /etc/os-release 2>/dev/null; then
@@ -43,6 +70,14 @@ detect_env() {
         ENV_TYPE="alpine"
         PKG_MANAGER="apk"
         SUDO=""
+    elif command -v zypper >/dev/null 2>&1; then
+        ENV_TYPE="opensuse"
+        PKG_MANAGER="zypper"
+        SUDO="sudo"
+    elif command -v xbps-install >/dev/null 2>&1; then
+        ENV_TYPE="void"
+        PKG_MANAGER="xbps-install"
+        SUDO="sudo"
     else
         ENV_TYPE="unknown"
         PKG_MANAGER=""
@@ -152,9 +187,21 @@ show_logo() {
     local line=""; local i=0
     while [ $i -lt $w ]; do line="${line}-"; i=$(( i + 1 )); done
     printf "${MAGENTA}%s${NC}\n\n" "$line"
-    center_text "${CYAN}* AI-CICADA INSTALLER v4.0 *${NC}"
-    center_text "${YELLOW}Platform: ${ENV_TYPE}${NC}"
-    if [ "$ENV_TYPE" = "homeassistant" ]; then
+    center_text "${CYAN}* AI-CICADA INSTALLER v5.0 *${NC}"
+    local display_env="$ENV_TYPE"
+    case "$ENV_TYPE" in
+        wsl|wsl-ha) display_env="WSL (Windows)" ;;
+        homeassistant) display_env="Home Assistant" ;;
+        termux) display_env="Termux (Android)" ;;
+        debian) display_env="Debian/Ubuntu" ;;
+        fedora) display_env="Fedora" ;;
+        arch) display_env="Arch Linux" ;;
+        alpine) display_env="Alpine Linux" ;;
+        opensuse) display_env="openSUSE" ;;
+        void) display_env="Void Linux" ;;
+    esac
+    center_text "${YELLOW}Platform: ${display_env}${NC}"
+    if [ "$ENV_TYPE" = "homeassistant" ] || [ "$ENV_TYPE" = "wsl-ha" ]; then
         printf "\n"
         center_text "${GREEN}[Home Assistant mode] /config/.ai-cicada${NC}"
     fi
@@ -166,49 +213,153 @@ show_logo() {
     press_any_key
 }
 
+get_system_ram_gb() {
+    local ram_gb=0
+    if command -v free >/dev/null 2>&1; then
+        ram_gb=$(free -g | awk '/^Mem:/{print $2}')
+    elif [ -f /proc/meminfo ]; then
+        ram_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+        ram_gb=$((ram_kb / 1024 / 1024))
+    fi
+    echo "$ram_gb"
+}
+
 select_model() {
     clear
     center_text "${CYAN}Select Model:${NC}"
     printf "\n"
-    if [ "$ENV_TYPE" = "homeassistant" ]; then
-        draw_box \
-            "1) qwen2.5-coder:1.5b (HA - mало RAM)" \
-            "2) qwen2.5-coder:3b   (recommended)" \
-            "3) llama3.2:3b        (HA - баланс)" \
-            "4) phi3:mini          (лёгкая)" \
-            "5) mistral:7b         (мощная)" \
-            "6) Manual input"
+    
+    # Detect system RAM
+    local SYS_RAM=$(get_system_ram_gb)
+    local RAM_RECOMMEND=""
+    
+    printf "${YELLOW}Определено RAM: ~${SYS_RAM} GB${NC}\n"
+    printf "${YELLOW}Платформа: ${ENV_TYPE}${NC}\n\n"
+    
+    # Static table header
+    printf "${NC}┌────────────────────┬──────────┬────────────┬──────────┬───────────────────┐\n"
+    printf "│ ${CYAN}%-18s${NC} │ ${MAGENTA}%-8s${NC} │ ${YELLOW}%-10s${NC} │ ${GREEN}%-8s${NC} │ %-17s │\n" "Модель" "RAM" "Скорость" "Качество" "Применение"
+    printf "├────────────────────┼──────────┼────────────┼──────────┼───────────────────┤\n"
+    
+    local choice_num=0
+    local choices=()
+    
+    # Model definitions: name|ram|speed|quality|use|ollama_name
+    # Always show all models, but mark suitable ones
+    
+    if [ "$ENV_TYPE" = "homeassistant" ] || [ "$ENV_TYPE" = "wsl-ha" ]; then
+        # Home Assistant mode - 5 options
+        local models=(
+            "qwen2.5-coder 1.5B|2-4 GB|⚡⚡⚡⚡⚡⚡|⭐⭐⭐|код/HA|qwen2.5-coder:1.5b"
+            "qwen2.5-coder 3B|4-6 GB|🚀🚀🚀🚀🚀|⭐⭐⭐⭐|код (реком.)|qwen2.5-coder:3b"
+            "llama3.2 3B|4-6 GB|🚀🚀🚀🚀|⭐⭐⭐⭐|чат/логика|llama3.2:3b"
+            "phi3 mini|2-4 GB|⚡⚡⚡⚡⚡⚡|⭐⭐|слабые устр.|phi3:mini"
+            "mistral 7B|10-14 GB|⚖️|⭐⭐⭐⭐|мощь (медл.)|mistral:7b"
+        )
+        
+        for model in "${models[@]}"; do
+            IFS='|' read -r name ram speed quality use ollama_name <<< "$model"
+            ((choice_num++))
+            choices[$choice_num]="$ollama_name"
+            
+            # Check if suitable for this system
+            local ram_min=$(echo "$ram" | cut -d'-' -f1 | tr -d ' GB')
+            local marker=""
+            local line_color="$NC"
+            
+            if [ "$SYS_RAM" -ge "$((ram_min + 2))" ] 2>/dev/null || [ "$ENV_TYPE" = "homeassistant" ]; then
+                marker="${GREEN}✓${NC} "
+                line_color="$GREEN"
+                if [ -z "$RAM_RECOMMEND" ]; then
+                    RAM_RECOMMEND="$choice_num"
+                fi
+            elif [ "$SYS_RAM" -ge "$ram_min" ] 2>/dev/null; then
+                marker="${YELLOW}~${NC} "
+                line_color="$YELLOW"
+            else
+                marker="${RED}✗${NC} "
+                line_color="$RED"
+            fi
+            
+            printf "${line_color}│${NC} ${marker}${CYAN}%-17s${NC} │ ${MAGENTA}%-8s${NC} │ ${YELLOW}%-10s${NC} │ ${GREEN}%-8s${NC} │ %-17s │\n" "$name" "$ram" "$speed" "$quality" "$use"
+        done
+        
+        # Manual input option
+        ((choice_num++))
+        choices[$choice_num]="MANUAL"
+        printf "│ ${GREEN}6)${NC} ${CYAN}%-17s${NC} │ ${MAGENTA}%-8s${NC} │ ${YELLOW}%-10s${NC} │ ${GREEN}%-8s${NC} │ %-17s │\n" "Вручную" "-" "-" "-" "другая модель"
+        
     else
-        draw_box \
-            "1) qwen2.5-coder:3b  (recommended)" \
-            "2) llama3:8b" \
-            "3) mistral:7b" \
-            "4) phi3:mini" \
-            "5) Manual input"
+        # Standard mode - 4 options
+        local models=(
+            "qwen2.5-coder 3B|4-6 GB|🚀🚀🚀🚀🚀|⭐⭐⭐⭐|код (реком.)|qwen2.5-coder:3b"
+            "llama3 8B|12-16 GB|🐢🐢|⭐⭐⭐⭐⭐|чат/логика|llama3:8b"
+            "mistral 7B|10-14 GB|⚖️|⭐⭐⭐⭐|универсал|mistral:7b"
+            "phi3 mini|2-4 GB|⚡⚡⚡⚡⚡⚡|⭐⭐|слабые устр.|phi3:mini"
+        )
+        
+        for model in "${models[@]}"; do
+            IFS='|' read -r name ram speed quality use ollama_name <<< "$model"
+            ((choice_num++))
+            choices[$choice_num]="$ollama_name"
+            
+            # Check if suitable for this system
+            local ram_min=$(echo "$ram" | cut -d'-' -f1 | tr -d ' GB')
+            local marker=""
+            local line_color="$NC"
+            
+            if [ "$SYS_RAM" -ge "$((ram_min + 2))" ] 2>/dev/null; then
+                marker="${GREEN}✓${NC} "
+                line_color="$GREEN"
+                if [ -z "$RAM_RECOMMEND" ]; then
+                    RAM_RECOMMEND="$choice_num"
+                fi
+            elif [ "$SYS_RAM" -ge "$ram_min" ] 2>/dev/null; then
+                marker="${YELLOW}~${NC} "
+                line_color="$YELLOW"
+            else
+                marker="${RED}✗${NC} "
+                line_color="$RED"
+            fi
+            
+            printf "${line_color}│${NC} ${marker}${CYAN}%-17s${NC} │ ${MAGENTA}%-8s${NC} │ ${YELLOW}%-10s${NC} │ ${GREEN}%-8s${NC} │ %-17s │\n" "$name" "$ram" "$speed" "$quality" "$use"
+        done
+        
+        # Manual input option
+        ((choice_num++))
+        choices[$choice_num]="MANUAL"
+        printf "│ ${GREEN}5)${NC} ${CYAN}%-17s${NC} │ ${MAGENTA}%-8s${NC} │ ${YELLOW}%-10s${NC} │ ${GREEN}%-8s${NC} │ %-17s │\n" "Вручную" "-" "-" "-" "другая модель"
     fi
-    printf "\n${YELLOW}Choice: ${NC}"
+    
+    printf "└────────────────────┴──────────┴────────────┴──────────┴───────────────────┘\n"
+    
+    # Legend
+    printf "\n${GREEN}✓${NC} - идеально подходит  ${YELLOW}~${NC} - работает впритык  ${RED}✗${NC} - может не хватить RAM\n"
+    
+    if [ -n "$RAM_RECOMMEND" ]; then
+        printf "\n${GREEN}💡 Рекомендуется: выбор $RAM_RECOMMEND${NC}\n"
+    fi
+    
+    printf "\n${YELLOW}Ваш выбор (1-$choice_num): ${NC}"
     read -r choice </dev/tty
-    if [ "$ENV_TYPE" = "homeassistant" ]; then
-        case $choice in
-            1) MODEL="qwen2.5-coder:1.5b" ;;
-            2) MODEL="qwen2.5-coder:3b" ;;
-            3) MODEL="llama3.2:3b" ;;
-            4) MODEL="phi3:mini" ;;
-            5) MODEL="mistral:7b" ;;
-            6) printf "${YELLOW}Enter model name: ${NC}"; read -r MODEL </dev/tty ;;
-            *) printf "${RED}Invalid choice${NC}\n"; sleep 2; select_model; return ;;
-        esac
+    
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$choice_num" ]; then
+        if [ "${choices[$choice]}" = "MANUAL" ]; then
+            printf "${YELLOW}Введите имя модели: ${NC}"
+            read -r MODEL </dev/tty
+        else
+            MODEL="${choices[$choice]}"
+        fi
     else
-        case $choice in
-            1) MODEL="qwen2.5-coder:3b" ;;
-            2) MODEL="llama3:8b" ;;
-            3) MODEL="mistral:7b" ;;
-            4) MODEL="phi3:mini" ;;
-            5) printf "${YELLOW}Enter model name: ${NC}"; read -r MODEL </dev/tty ;;
-            *) printf "${RED}Invalid choice${NC}\n"; sleep 2; select_model; return ;;
-        esac
+        printf "${RED}Неверный выбор${NC}\n"
+        sleep 2
+        select_model
+        return
     fi
+    
     log "Selected model: $MODEL"
+    printf "\n${GREEN}✓ Выбрана модель: $MODEL${NC}\n"
+    sleep 1
     clear
 }
 
@@ -226,7 +377,7 @@ update_system() {
             (yes N | pkg update -y 2>>"$LOG_FILE" && yes N | pkg upgrade -y 2>>"$LOG_FILE") &
             spinner $!
             ;;
-        debian)
+        debian|wsl)
             (sudo DEBIAN_FRONTEND=noninteractive apt update -y >> "$LOG_FILE" 2>&1 && \
              sudo DEBIAN_FRONTEND=noninteractive apt upgrade -y \
                -o Dpkg::Options::="--force-confold" \
@@ -241,8 +392,16 @@ update_system() {
             (sudo pacman -Syu --noconfirm >> "$LOG_FILE" 2>&1) &
             spinner $!
             ;;
-        homeassistant|alpine)
+        homeassistant|alpine|wsl-ha)
             (apk update >> "$LOG_FILE" 2>&1) &
+            spinner $!
+            ;;
+        opensuse)
+            (sudo zypper refresh >> "$LOG_FILE" 2>&1 && sudo zypper update -y >> "$LOG_FILE" 2>&1) &
+            spinner $!
+            ;;
+        void)
+            (sudo xbps-install -Syu >> "$LOG_FILE" 2>&1) &
             spinner $!
             ;;
         *)
@@ -264,10 +423,12 @@ install_nodejs() {
     timer_start
     case $ENV_TYPE in
         termux)   (yes N | pkg install -y nodejs 2>>"$LOG_FILE") & spinner $! ;;
-        debian)   (sudo DEBIAN_FRONTEND=noninteractive apt install -y nodejs npm >> "$LOG_FILE" 2>&1) & spinner $! ;;
+        debian|wsl)   (sudo DEBIAN_FRONTEND=noninteractive apt install -y nodejs npm >> "$LOG_FILE" 2>&1) & spinner $! ;;
         fedora)   (sudo dnf install -y nodejs npm >> "$LOG_FILE" 2>&1) & spinner $! ;;
         arch)     (sudo pacman -S --noconfirm nodejs npm >> "$LOG_FILE" 2>&1) & spinner $! ;;
-        homeassistant|alpine) (apk add --no-cache nodejs npm >> "$LOG_FILE" 2>&1) & spinner $! ;;
+        homeassistant|alpine|wsl-ha) (apk add --no-cache nodejs npm >> "$LOG_FILE" 2>&1) & spinner $! ;;
+        opensuse) (sudo zypper install -y nodejs npm >> "$LOG_FILE" 2>&1) & spinner $! ;;
+        void)     (sudo xbps-install -y nodejs >> "$LOG_FILE" 2>&1) & spinner $! ;;
         *) printf "${YELLOW}Please install Node.js manually${NC}\n"; return ;;
     esac
     timer_end
@@ -287,10 +448,12 @@ install_sqlite_tools() {
     fi
     case $ENV_TYPE in
         termux)   (yes N | pkg install -y sqlite 2>>"$LOG_FILE") & spinner $! ;;
-        debian)   (sudo apt install -y sqlite3 >> "$LOG_FILE" 2>&1) & spinner $! ;;
+        debian|wsl)   (sudo apt install -y sqlite3 >> "$LOG_FILE" 2>&1) & spinner $! ;;
         fedora)   (sudo dnf install -y sqlite >> "$LOG_FILE" 2>&1) & spinner $! ;;
         arch)     (sudo pacman -S --noconfirm sqlite >> "$LOG_FILE" 2>&1) & spinner $! ;;
-        homeassistant|alpine) (apk add --no-cache sqlite >> "$LOG_FILE" 2>&1) & spinner $! ;;
+        homeassistant|alpine|wsl-ha) (apk add --no-cache sqlite >> "$LOG_FILE" 2>&1) & spinner $! ;;
+        opensuse) (sudo zypper install -y sqlite3 >> "$LOG_FILE" 2>&1) & spinner $! ;;
+        void)     (sudo xbps-install -y sqlite >> "$LOG_FILE" 2>&1) & spinner $! ;;
     esac
     printf "${GREEN}SQLite tools ready${NC}\n"
 }
@@ -318,7 +481,7 @@ install_ollama() {
                 chmod +x "$PREFIX/bin/ollama"
             fi
             ;;
-        homeassistant)
+        homeassistant|wsl-ha)
             printf "${YELLOW}Home Assistant: installing Ollama binary for Alpine/musl...${NC}\n"
             ARCH=$(uname -m)
             case $ARCH in
@@ -333,6 +496,11 @@ install_ollama() {
             (curl -fsSL "https://github.com/ollama/ollama/releases/latest/download/${OLLAMA_BIN}" \
                 -o /usr/local/bin/ollama >> "$LOG_FILE" 2>&1 && \
              chmod +x /usr/local/bin/ollama) &
+            spinner $!
+            ;;
+        wsl)
+            printf "${YELLOW}WSL detected: using standard Ollama installer...${NC}\n"
+            curl -fsSL https://ollama.com/install.sh | sh >> "$LOG_FILE" 2>&1 &
             spinner $!
             ;;
         *)
@@ -359,9 +527,18 @@ start_ollama_service() {
         termux)
             ollama serve >> "$LOG_FILE" 2>&1 &
             ;;
-        homeassistant)
+        homeassistant|wsl-ha)
             ollama serve >> "$LOG_FILE" 2>&1 &
-            printf "${YELLOW}Ollama running in background. After HA reboot run: ollama serve &${NC}\n"
+            printf "${YELLOW}Ollama running in background. After reboot run: ollama serve &${NC}\n"
+            ;;
+        wsl)
+            # WSL may not have systemd, try to use it if available, otherwise background
+            if command -v systemctl >/dev/null 2>&1 && systemctl is-system-running >/dev/null 2>&1; then
+                sudo systemctl enable --now ollama >> "$LOG_FILE" 2>&1 || ollama serve >> "$LOG_FILE" 2>&1 &
+            else
+                printf "${YELLOW}WSL: Starting Ollama in background (no systemd)${NC}\n"
+                ollama serve >> "$LOG_FILE" 2>&1 &
+            fi
             ;;
         *)
             if command -v systemctl >/dev/null 2>&1; then
@@ -403,14 +580,15 @@ install_npm_deps() {
     cat > package.json << 'PKGEOF'
 {
   "name": "ai-cicada",
-  "version": "4.0.0",
+  "version": "5.0.0",
   "main": "server.js",
   "dependencies": {
-    "better-sqlite3": "^9.4.3"
+    "better-sqlite3": "^9.4.3",
+    "axios": "^1.6.0"
   }
 }
 PKGEOF
-    (npm install --save better-sqlite3 >> "$LOG_FILE" 2>&1) &
+    (npm install --save better-sqlite3 axios >> "$LOG_FILE" 2>&1) &
     spinner $!
     if [ -d "$CHAT_DIR/node_modules/better-sqlite3" ]; then
         printf "${GREEN}better-sqlite3 installed${NC}\n"
@@ -435,10 +613,13 @@ const http   = require('http');
 const fs     = require('fs');
 const path   = require('path');
 const crypto = require('crypto');
+const https  = require('https');
 
 const PORT       = 3000;
 const MODEL      = process.env.AI_MODEL || 'qwen2.5-coder:3b';
 const DB_PATH    = path.join(__dirname, 'cicada.db');
+let axios = null;
+try { axios = require('axios'); } catch(e) { console.log('axios not available, web search disabled'); }
 
 /* ====== SQLite init ====== */
 let db = null;
@@ -455,7 +636,8 @@ function initDB() {
             "  username TEXT UNIQUE NOT NULL," +
             "  password TEXT NOT NULL," +
             "  created_at INTEGER DEFAULT (strftime('%s','now'))," +
-            "  total_msgs INTEGER DEFAULT 0" +
+            "  total_msgs INTEGER DEFAULT 0," +
+            "  preferences TEXT DEFAULT '{}'" +
             ");" +
             "CREATE TABLE IF NOT EXISTS chats (" +
             "  id TEXT PRIMARY KEY," +
@@ -473,8 +655,19 @@ function initDB() {
             "  created_at INTEGER DEFAULT (strftime('%s','now'))," +
             "  FOREIGN KEY(chat_id) REFERENCES chats(id) ON DELETE CASCADE" +
             ");" +
+            "CREATE TABLE IF NOT EXISTS memory (" +
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT," +
+            "  username TEXT NOT NULL," +
+            "  key TEXT NOT NULL," +
+            "  value TEXT NOT NULL," +
+            "  category TEXT DEFAULT 'general'," +
+            "  created_at INTEGER DEFAULT (strftime('%s','now'))," +
+            "  updated_at INTEGER DEFAULT (strftime('%s','now'))," +
+            "  UNIQUE(username, key)" +
+            ");" +
             "CREATE INDEX IF NOT EXISTS idx_chats_user ON chats(username);" +
-            "CREATE INDEX IF NOT EXISTS idx_msgs_chat  ON messages(chat_id);"
+            "CREATE INDEX IF NOT EXISTS idx_msgs_chat  ON messages(chat_id);" +
+            "CREATE INDEX IF NOT EXISTS idx_memory_user ON memory(username);"
         );
         console.log('SQLite DB initialised: ' + DB_PATH);
     } catch(e) {
@@ -484,7 +677,7 @@ function initDB() {
 }
 
 /* ====== In-memory fallback ====== */
-const mem = { users: {}, chats: {} };
+const mem = { users: {}, chats: {}, memory: {} };
 
 function hashPwd(p) { return crypto.createHash('sha256').update(p).digest('hex'); }
 
@@ -497,7 +690,7 @@ function createUser(username, password) {
         } catch(e) { return false; }
     }
     if (mem.users[username]) return false;
-    mem.users[username] = { password: hashPwd(password), created_at: Math.floor(Date.now()/1000), total_msgs: 0 };
+    mem.users[username] = { password: hashPwd(password), created_at: Math.floor(Date.now()/1000), total_msgs: 0, preferences: {} };
     return true;
 }
 
@@ -581,16 +774,214 @@ function getUserStats(username) {
         const msgCount  = (db.prepare(
             'SELECT COUNT(*) as n FROM messages m JOIN chats c ON c.id=m.chat_id WHERE c.username=?'
         ).get(username) || { n: 0 }).n;
-        return { total_msgs: (u && u.total_msgs) || 0, chat_count: chatCount, msg_count: msgCount, created_at: u && u.created_at };
+        const memCount = (db.prepare('SELECT COUNT(*) as n FROM memory WHERE username=?').get(username) || { n: 0 }).n;
+        return { total_msgs: (u && u.total_msgs) || 0, chat_count: chatCount, msg_count: msgCount, memory_count: memCount, created_at: u && u.created_at };
     }
     const u = mem.users[username] || {};
     const chats = Object.values(mem.chats).filter(function(c){ return c.username === username; });
+    const mems = mem.memory[username] || {};
     return {
         total_msgs: u.total_msgs || 0,
         chat_count: chats.length,
         msg_count: chats.reduce(function(s,c){ return s + c.messages.length; }, 0),
+        memory_count: Object.keys(mems).length,
         created_at: u.created_at
     };
+}
+
+/* ====== MEMORY SYSTEM ====== */
+function setMemory(username, key, value, category) {
+    category = category || 'general';
+    if (db) {
+        try {
+            db.prepare('INSERT OR REPLACE INTO memory (username, key, value, category, updated_at) VALUES (?, ?, ?, ?, strftime("%s","now"))')
+                .run(username, key, value, category);
+            return true;
+        } catch(e) { console.error('Memory save error:', e); return false; }
+    }
+    if (!mem.memory[username]) mem.memory[username] = {};
+    mem.memory[username][key] = { value: value, category: category, updated_at: Math.floor(Date.now()/1000) };
+    return true;
+}
+
+function getMemory(username, key) {
+    if (db) {
+        const row = db.prepare('SELECT value, category FROM memory WHERE username=? AND key=?').get(username, key);
+        return row || null;
+    }
+    if (mem.memory[username] && mem.memory[username][key]) {
+        return { value: mem.memory[username][key].value, category: mem.memory[username][key].category };
+    }
+    return null;
+}
+
+function getAllMemory(username, category) {
+    if (db) {
+        if (category) {
+            return db.prepare('SELECT key, value, category, updated_at FROM memory WHERE username=? AND category=? ORDER BY updated_at DESC')
+                .all(username, category);
+        }
+        return db.prepare('SELECT key, value, category, updated_at FROM memory WHERE username=? ORDER BY updated_at DESC')
+            .all(username);
+    }
+    const userMem = mem.memory[username] || {};
+    return Object.keys(userMem).map(function(k) {
+        return { key: k, value: userMem[k].value, category: userMem[k].category, updated_at: userMem[k].updated_at };
+    });
+}
+
+function deleteMemory(username, key) {
+    if (db) {
+        db.prepare('DELETE FROM memory WHERE username=? AND key=?').run(username, key);
+        return;
+    }
+    if (mem.memory[username]) delete mem.memory[username][key];
+}
+
+function searchMemory(username, query) {
+    if (db) {
+        return db.prepare("SELECT key, value, category FROM memory WHERE username=? AND (key LIKE ? OR value LIKE ?)")
+            .all(username, '%' + query + '%', '%' + query + '%');
+    }
+    const userMem = mem.memory[username] || {};
+    const results = [];
+    Object.keys(userMem).forEach(function(k) {
+        if (k.toLowerCase().includes(query.toLowerCase()) || userMem[k].value.toLowerCase().includes(query.toLowerCase())) {
+            results.push({ key: k, value: userMem[k].value, category: userMem[k].category });
+        }
+    });
+    return results;
+}
+
+/* ====== WEB SEARCH ====== */
+async function webSearch(query, maxResults) {
+    maxResults = maxResults || 5;
+    if (!axios) return { error: 'Web search not available (axios not installed)' };
+    
+    try {
+        // DuckDuckGo HTML scraping approach
+        const searchUrl = 'https://html.duckduckgo.com/html/?q=' + encodeURIComponent(query);
+        const response = await axios.get(searchUrl, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            },
+            timeout: 10000
+        });
+        
+        const html = response.data;
+        const results = [];
+        
+        // Parse results from DuckDuckGo HTML
+        const resultRegex = /<a rel="nofollow" class="result__a" href="([^"]+)"[^>]*>([^<]+)<\/a>/g;
+        const snippetRegex = /<a rel="nofollow" class="result__snippet"[^>]*>([^<]+)<\/a>/g;
+        
+        let match;
+        const titles = [];
+        const urls = [];
+        
+        while ((match = resultRegex.exec(html)) !== null && urls.length < maxResults) {
+            urls.push(match[1]);
+            titles.push(match[2].replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>'));
+        }
+        
+        for (let i = 0; i < urls.length; i++) {
+            results.push({
+                title: titles[i] || 'No title',
+                url: urls[i],
+                snippet: ''
+            });
+        }
+        
+        return { results: results, query: query };
+    } catch(e) {
+        console.error('Web search error:', e.message);
+        return { error: 'Search failed: ' + e.message, results: [] };
+    }
+}
+
+/* ====== TOOLS SYSTEM ====== */
+const TOOLS = {
+    web_search: {
+        name: 'web_search',
+        description: 'Search the web for current information',
+        parameters: {
+            query: { type: 'string', description: 'Search query' },
+            max_results: { type: 'number', description: 'Maximum results (1-10)', default: 5 }
+        }
+    },
+    memory_set: {
+        name: 'memory_set',
+        description: 'Save a fact or information to memory for later recall',
+        parameters: {
+            key: { type: 'string', description: 'Memory key/topic' },
+            value: { type: 'string', description: 'Information to remember' },
+            category: { type: 'string', description: 'Category (general, preference, fact)', default: 'general' }
+        }
+    },
+    memory_get: {
+        name: 'memory_get',
+        description: 'Retrieve information from memory',
+        parameters: {
+            key: { type: 'string', description: 'Memory key to retrieve' }
+        }
+    },
+    memory_search: {
+        name: 'memory_search',
+        description: 'Search through all stored memories',
+        parameters: {
+            query: { type: 'string', description: 'Search query' }
+        }
+    },
+    calculate: {
+        name: 'calculate',
+        description: 'Perform mathematical calculations',
+        parameters: {
+            expression: { type: 'string', description: 'Mathematical expression' }
+        }
+    }
+};
+
+async function executeTool(toolName, args, username) {
+    switch(toolName) {
+        case 'web_search':
+            return await webSearch(args.query, args.max_results || 5);
+        case 'memory_set':
+            const saved = setMemory(username, args.key, args.value, args.category || 'general');
+            return { success: saved, key: args.key, message: 'Saved to memory: ' + args.key };
+        case 'memory_get':
+            const mem = getMemory(username, args.key);
+            return mem || { error: 'Memory not found: ' + args.key };
+        case 'memory_search':
+            return { results: searchMemory(username, args.query) };
+        case 'calculate':
+            try {
+                // Safe eval alternative
+                const result = Function('"use strict"; return (' + args.expression + ')')();
+                return { result: result, expression: args.expression };
+            } catch(e) {
+                return { error: 'Calculation failed: ' + e.message };
+            }
+        default:
+            return { error: 'Unknown tool: ' + toolName };
+    }
+}
+
+function formatToolsForPrompt() {
+    let prompt = '\n\nYou have access to the following tools:\n';
+    Object.keys(TOOLS).forEach(function(key) {
+        const tool = TOOLS[key];
+        prompt += '\n' + tool.name + ': ' + tool.description;
+        prompt += '\n  Parameters:';
+        Object.keys(tool.parameters).forEach(function(p) {
+            const param = tool.parameters[p];
+            prompt += '\n    - ' + p + ' (' + param.type + '): ' + param.description;
+            if (param.default) prompt += ' [default: ' + param.default + ']';
+        });
+    });
+    prompt += '\n\nTo use a tool, respond with JSON in this format:\n';
+    prompt += '{"tool": "tool_name", "arguments": {"param1": "value1", ...}}\n';
+    prompt += '\nThe system will execute the tool and return results.';
+    return prompt;
 }
 
 /* ====== HTTP helpers ====== */
@@ -632,7 +1023,7 @@ const server = http.createServer(async function(req, res) {
     }
 
     if (req.method === 'GET' && url === '/model') {
-        return jsonOk(res, { model: MODEL });
+        return jsonOk(res, { model: MODEL, tools: Object.keys(TOOLS), web_search: !!axios });
     }
 
     /* Auth */
@@ -705,14 +1096,83 @@ const server = http.createServer(async function(req, res) {
         } catch(e) { return jsonErr(res, 400, e.message); }
     }
 
-    /* Ollama stream */
+    /* Memory API */
+    if (req.method === 'GET' && url === '/api/memory') {
+        const username = new URLSearchParams(req.url.split('?')[1] || '').get('user');
+        const category = new URLSearchParams(req.url.split('?')[1] || '').get('category');
+        if (!username) return jsonErr(res, 400, 'user required');
+        return jsonOk(res, { memory: getAllMemory(username, category) });
+    }
+
+    if (req.method === 'POST' && url === '/api/memory') {
+        try {
+            const body = await parseBody(req);
+            if (!body.username || !body.key || !body.value) return jsonErr(res, 400, 'username, key, value required');
+            const saved = setMemory(body.username, body.key, body.value, body.category);
+            return jsonOk(res, { ok: saved, key: body.key });
+        } catch(e) { return jsonErr(res, 400, e.message); }
+    }
+
+    if (req.method === 'DELETE' && url.startsWith('/api/memory/')) {
+        const key = decodeURIComponent(url.slice('/api/memory/'.length));
+        const username = new URLSearchParams(req.url.split('?')[1] || '').get('user');
+        if (!username || !key) return jsonErr(res, 400, 'user and key required');
+        deleteMemory(username, key);
+        return jsonOk(res, { ok: true });
+    }
+
+    /* Web Search API */
+    if (req.method === 'POST' && url === '/api/search') {
+        try {
+            const body = await parseBody(req);
+            if (!body.query) return jsonErr(res, 400, 'query required');
+            const results = await webSearch(body.query, body.max_results || 5);
+            return jsonOk(res, results);
+        } catch(e) { return jsonErr(res, 500, e.message); }
+    }
+
+    /* Tools API */
+    if (req.method === 'POST' && url === '/api/tool') {
+        try {
+            const body = await parseBody(req);
+            if (!body.tool || !body.username) return jsonErr(res, 400, 'tool and username required');
+            const result = await executeTool(body.tool, body.arguments || {}, body.username);
+            return jsonOk(res, result);
+        } catch(e) { return jsonErr(res, 500, e.message); }
+    }
+
+    if (req.method === 'GET' && url === '/api/tools') {
+        return jsonOk(res, { tools: TOOLS });
+    }
+
+    /* Ollama stream with tool support */
     if (req.method === 'POST' && url === '/chat') {
         var body = '';
         req.on('data', function(chunk) { body += chunk; });
         req.on('end', function() {
-            var messages;
-            try { messages = JSON.parse(body).messages; }
+            var data;
+            try { data = JSON.parse(body); }
             catch(e) { res.writeHead(400); res.end('Bad JSON'); return; }
+            
+            var messages = data.messages || [];
+            var username = data.username;
+            var enableTools = data.tools !== false;
+            
+            // Add tools info to system message if enabled
+            if (enableTools) {
+                var hasSystem = messages.some(function(m) { return m.role === 'system'; });
+                var toolsPrompt = formatToolsForPrompt();
+                if (hasSystem) {
+                    messages = messages.map(function(m) {
+                        if (m.role === 'system') {
+                            return { role: 'system', content: m.content + toolsPrompt };
+                        }
+                        return m;
+                    });
+                } else {
+                    messages.unshift({ role: 'system', content: 'You are a helpful AI assistant.' + toolsPrompt });
+                }
+            }
 
             var payload = JSON.stringify({ model: MODEL, messages: messages, stream: true });
             var options = {
@@ -754,9 +1214,10 @@ const server = http.createServer(async function(req, res) {
 
 initDB();
 server.listen(PORT, '0.0.0.0', function() {
-    console.log('\nAI-CICADA Web Chat v4.0');
+    console.log('\nAI-CICADA Web Chat v5.0 - With Tools, Memory & Web Search');
     console.log('Model  : ' + MODEL);
     console.log('DB     : ' + (db ? DB_PATH : 'in-memory (fallback)'));
+    console.log('Tools  : ' + Object.keys(TOOLS).join(', '));
     console.log('Open   : http://localhost:' + PORT);
     console.log('\nPress Ctrl+C to stop\n');
 });
@@ -780,12 +1241,12 @@ html = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>AI-CICADA</title>
+<title>AI-CICADA v5</title>
 <link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@400;700;900&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
-  --bg:#070708;--bg2:#0e0e10;--bg3:#161618;
+  --bg:#070708;--bg2:#0e0e10;--bg3:#161618;--bg4:#1e1e22;
   --border:rgba(255,255,255,0.06);--border2:rgba(255,255,255,0.12);
   --accent:#c8ff00;--accent2:#00e5ff;--accent3:#ff3cac;
   --text:#f0f0f0;--text2:#888;--text3:#555;
@@ -809,16 +1270,23 @@ body::after{content:'';position:fixed;width:600px;height:600px;border-radius:50%
 .card p{color:var(--text2);font-size:13px;margin-bottom:24px;line-height:1.5}
 .field{margin-bottom:14px}
 .field label{display:block;font-size:11px;color:var(--text2);letter-spacing:1px;text-transform:uppercase;margin-bottom:6px}
-.field input{width:100%;background:var(--bg3);border:1px solid var(--border2);border-radius:var(--r);color:var(--text);font-family:var(--font-mono);font-size:14px;padding:12px 14px;outline:none;transition:border-color .2s,box-shadow .2s}
-.field input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(200,255,0,0.1)}
-.field input::placeholder{color:var(--text3)}
+.field input, .field select, .field textarea{width:100%;background:var(--bg3);border:1px solid var(--border2);border-radius:var(--r);color:var(--text);font-family:var(--font-mono);font-size:14px;padding:12px 14px;outline:none;transition:border-color .2s,box-shadow .2s}
+.field input:focus, .field select:focus, .field textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(200,255,0,0.1)}
+.field input::placeholder, .field textarea::placeholder{color:var(--text3)}
 .btn{width:100%;padding:14px;border:none;border-radius:var(--r);font-family:var(--font-head);font-size:13px;font-weight:700;letter-spacing:1px;cursor:pointer;transition:all .2s;margin-top:4px}
 .btn-primary{background:linear-gradient(135deg,var(--accent),#aadd00);color:#000;box-shadow:0 4px 20px rgba(200,255,0,0.3)}
 .btn-primary:hover{transform:translateY(-1px);box-shadow:0 8px 30px rgba(200,255,0,0.4)}
+.btn-secondary{background:linear-gradient(135deg,var(--accent2),#00aadd);color:#000;box-shadow:0 4px 20px rgba(0,229,255,0.3)}
+.btn-secondary:hover{transform:translateY(-1px);box-shadow:0 8px 30px rgba(0,229,255,0.4)}
 .btn-ghost{background:transparent;border:1px solid var(--border2);color:var(--text2);margin-top:10px}
 .btn-ghost:hover{border-color:var(--accent2);color:var(--accent2)}
+.btn-icon{width:36px;height:36px;border-radius:10px;border:none;background:var(--bg3);color:var(--text2);font-size:14px;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:all .2s}
+.btn-icon:hover{background:var(--accent);color:#000}
+.btn-icon.active{background:var(--accent);color:#000}
 .error-msg{background:rgba(255,60,172,0.1);border:1px solid rgba(255,60,172,0.3);border-radius:8px;color:var(--accent3);padding:10px 12px;font-size:12px;margin-bottom:14px;display:none}
 .error-msg.show{display:block}
+.success-msg{background:rgba(200,255,0,0.1);border:1px solid rgba(200,255,0,0.3);border-radius:8px;color:var(--accent);padding:10px 12px;font-size:12px;margin-bottom:14px;display:none}
+.success-msg.show{display:block}
 #chatPage{flex-direction:column;padding:0;align-items:stretch;justify-content:flex-start}
 .app-layout{display:flex;height:100dvh;width:100%}
 .sidebar{width:260px;flex-shrink:0;background:var(--bg2);border-right:1px solid var(--border);display:flex;flex-direction:column;transition:transform .3s;z-index:100}
@@ -842,6 +1310,26 @@ body::after{content:'';position:fixed;width:600px;height:600px;border-radius:50%
 .history-item:hover .history-item-del{opacity:1}
 .history-item-del:hover{color:var(--accent3)!important;opacity:1!important}
 .history-empty{padding:20px 16px;text-align:center;color:var(--text3);font-size:12px;line-height:1.6}
+.sidebar-nav{display:flex;gap:4px;padding:8px 16px;border-top:1px solid var(--border)}
+.sidebar-nav-btn{flex:1;padding:8px;background:var(--bg3);border:1px solid var(--border);border-radius:8px;color:var(--text2);font-family:var(--font-mono);font-size:10px;cursor:pointer;transition:all .2s}
+.sidebar-nav-btn:hover{border-color:var(--accent);color:var(--accent)}
+.sidebar-nav-btn.active{background:rgba(200,255,0,0.1);border-color:var(--accent);color:var(--accent)}
+.sidebar-panel{flex:1;overflow-y:auto;padding:8px 16px;display:none}
+.sidebar-panel.active{display:block}
+.memory-item{padding:10px;background:var(--bg3);border:1px solid var(--border);border-radius:8px;margin-bottom:8px;cursor:pointer;transition:all .2s}
+.memory-item:hover{border-color:var(--accent2)}
+.memory-item-key{font-size:11px;color:var(--accent);margin-bottom:4px}
+.memory-item-value{font-size:12px;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.memory-item-cat{font-size:9px;color:var(--text3);text-transform:uppercase;letter-spacing:1px;margin-top:4px}
+.memory-form{display:flex;flex-direction:column;gap:8px;margin-top:12px}
+.memory-form input{background:var(--bg3);border:1px solid var(--border2);border-radius:8px;padding:10px 12px;color:var(--text);font-family:var(--font-mono);font-size:12px}
+.memory-form button{padding:10px;background:var(--accent);color:#000;border:none;border-radius:8px;font-family:var(--font-head);font-size:11px;font-weight:700;cursor:pointer}
+.search-result{padding:10px;background:var(--bg3);border:1px solid var(--border);border-radius:8px;margin-bottom:8px}
+.search-result-title{font-size:12px;color:var(--accent2);margin-bottom:4px}
+.search-result-url{font-size:10px;color:var(--text3);margin-bottom:4px}
+.search-result-snippet{font-size:11px;color:var(--text)}
+.tool-badge{display:inline-flex;align-items:center;gap:4px;padding:3px 8px;background:var(--bg3);border:1px solid var(--border2);border-radius:12px;font-size:10px;color:var(--accent2);margin-right:4px;margin-bottom:4px}
+.tool-badge.active{background:rgba(0,229,255,0.1);border-color:var(--accent2)}
 .sidebar-profile{padding:12px 16px;border-top:1px solid var(--border);display:flex;align-items:center;gap:10px;flex-shrink:0}
 .profile-avatar{width:32px;height:32px;border-radius:50%;background:linear-gradient(135deg,var(--accent3),var(--accent));display:flex;align-items:center;justify-content:center;font-size:14px;flex-shrink:0;color:#000;font-weight:700;font-family:var(--font-head)}
 .profile-info{flex:1;min-width:0}
@@ -854,6 +1342,7 @@ body::after{content:'';position:fixed;width:600px;height:600px;border-radius:50%
 .btn-menu{display:none;background:none;border:none;color:var(--text2);font-size:20px;cursor:pointer;padding:4px;flex-shrink:0}
 .topbar-title{flex:1;font-family:var(--font-head);font-size:13px;font-weight:700;color:var(--text);letter-spacing:1px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .model-badge{background:var(--bg3);border:1px solid var(--border2);border-radius:20px;padding:4px 10px;font-size:11px;color:var(--accent2);white-space:nowrap;flex-shrink:0}
+.tools-bar{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
 .status-indicator{width:8px;height:8px;border-radius:50%;background:var(--text3);flex-shrink:0;transition:background .3s}
 .status-indicator.online{background:var(--accent);box-shadow:0 0 8px var(--accent)}
 .status-indicator.loading{background:var(--accent2);animation:blink 1s infinite}
@@ -890,6 +1379,7 @@ body::after{content:'';position:fixed;width:600px;height:600px;border-radius:50%
 @keyframes dot{0%,80%,100%{opacity:.2;transform:scale(.8)}40%{opacity:1;transform:scale(1)}}
 .typing-wrap{display:flex;gap:10px}
 .input-area{padding:12px 16px;border-top:1px solid var(--border);background:var(--bg2);flex-shrink:0}
+.input-toolbar{display:flex;gap:8px;margin-bottom:8px;align-items:center;flex-wrap:wrap}
 .input-wrap{display:flex;align-items:flex-end;gap:10px;background:var(--bg3);border:1px solid var(--border2);border-radius:14px;padding:10px 10px 10px 16px;transition:border-color .2s}
 .input-wrap:focus-within{border-color:rgba(200,255,0,0.3)}
 #input{flex:1;background:none;border:none;color:var(--text);font-family:var(--font-mono);font-size:14px;resize:none;outline:none;max-height:120px;line-height:1.5}
@@ -905,8 +1395,8 @@ body::after{content:'';position:fixed;width:600px;height:600px;border-radius:50%
 .profile-big-avatar{width:64px;height:64px;border-radius:20px;background:linear-gradient(135deg,var(--accent3),var(--accent));display:flex;align-items:center;justify-content:center;font-size:28px;color:#000;font-family:var(--font-head);font-weight:900}
 .profile-big-name{font-family:var(--font-head);font-size:20px;font-weight:700}
 .profile-big-sub{font-size:12px;color:var(--text2);margin-top:3px}
-.stats-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:24px}
-.stat-card{background:var(--bg2);border:1px solid var(--border);border-radius:14px;padding:16px 12px;text-align:center}
+.stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:24px}
+.stat-card{background:var(--bg2);border:1px solid var(--border);border-radius:14px;padding:16px 8px;text-align:center}
 .stat-value{font-family:var(--font-head);font-size:22px;font-weight:900;color:var(--accent)}
 .stat-label{font-size:10px;color:var(--text3);margin-top:3px;text-transform:uppercase;letter-spacing:1px}
 .info-section{background:var(--bg2);border:1px solid var(--border);border-radius:16px;overflow:hidden;margin-bottom:16px}
@@ -919,16 +1409,49 @@ body::after{content:'';position:fixed;width:600px;height:600px;border-radius:50%
 .btn-back{display:block;width:100%;padding:14px;background:var(--bg2);border:1px solid var(--border2);border-radius:var(--r);font-family:var(--font-head);font-size:12px;color:var(--text2);cursor:pointer;transition:all .2s;text-align:center;letter-spacing:1px}
 .btn-back:hover{border-color:var(--accent);color:var(--accent)}
 .db-badge{display:inline-flex;align-items:center;gap:5px;font-size:10px;color:var(--accent2);background:rgba(0,229,255,0.08);border:1px solid rgba(0,229,255,0.2);border-radius:20px;padding:3px 10px;margin-top:6px}
-@media(max-width:600px){.sidebar{position:fixed;top:0;left:0;height:100%;transform:translateX(-100%)}.sidebar.open{transform:translateX(0)}.btn-menu{display:block}}
+.search-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.8);z-index:200;display:none;align-items:center;justify-content:center;padding:20px}
+.search-overlay.show{display:flex}
+.search-modal{width:100%;max-width:600px;background:var(--bg2);border:1px solid var(--border2);border-radius:var(--r2);padding:24px;max-height:80vh;overflow-y:auto}
+.search-modal h3{margin-bottom:16px;font-family:var(--font-head);color:var(--accent)}
+.search-input-wrap{display:flex;gap:8px;margin-bottom:16px}
+.search-input{flex:1;background:var(--bg3);border:1px solid var(--border2);border-radius:var(--r);padding:12px 16px;color:var(--text);font-family:var(--font-mono);font-size:14px}
+.search-btn{padding:12px 20px;background:var(--accent);color:#000;border:none;border-radius:var(--r);font-family:var(--font-head);font-size:12px;font-weight:700;cursor:pointer}
+.memory-modal{width:100%;max-width:500px;background:var(--bg2);border:1px solid var(--border2);border-radius:var(--r2);padding:24px;max-height:80vh;overflow-y:auto}
+.memory-modal h3{margin-bottom:16px;font-family:var(--font-head);color:var(--accent)}
+@media(max-width:600px){.sidebar{position:fixed;top:0;left:0;height:100%;transform:translateX(-100%)}.sidebar.open{transform:translateX(0)}.btn-menu{display:block}.stats-grid{grid-template-columns:repeat(2,1fr)}}
 </style>
 </head>
 <body>
+
+<div class="search-overlay" id="searchOverlay" onclick="closeSearch(event)">
+  <div class="search-modal" onclick="event.stopPropagation()">
+    <h3>&#128270; Web Search</h3>
+    <div class="search-input-wrap">
+      <input type="text" class="search-input" id="searchInput" placeholder="Введите поисковый запрос..." onkeydown="if(event.key==='Enter')doSearch()">
+      <button class="search-btn" onclick="doSearch()">Поиск</button>
+    </div>
+    <div id="searchResults"></div>
+  </div>
+</div>
+
+<div class="search-overlay" id="memoryOverlay" onclick="closeMemory(event)">
+  <div class="memory-modal" onclick="event.stopPropagation()">
+    <h3>&#129504; Memory / Память</h3>
+    <div id="memoryList" style="margin-bottom:16px"></div>
+    <div class="memory-form">
+      <input type="text" id="memKey" placeholder="Ключ (например: любимый_цвет)">
+      <input type="text" id="memValue" placeholder="Значение (например: синий)">
+      <input type="text" id="memCat" placeholder="Категория (general, preference, fact)">
+      <button onclick="saveMemory()">Сохранить в память</button>
+    </div>
+  </div>
+</div>
 
 <div class="page" id="loginPage">
   <div class="card">
     <div class="card-logo">
       <div class="card-logo-icon">&#129432;</div>
-      <div><div class="card-logo-name">AI-CICADA</div><div class="card-logo-sub">SQLite</div></div>
+      <div><div class="card-logo-name">AI-CICADA</div><div class="card-logo-sub">v5.0 +Tools +Memory +Search</div></div>
     </div>
     <h2>Вход</h2>
     <p>Войдите в аккаунт для начала работы</p>
@@ -949,6 +1472,7 @@ body::after{content:'';position:fixed;width:600px;height:600px;border-radius:50%
     <h2>Регистрация</h2>
     <p>Данные хранятся локально в SQLite</p>
     <div id="regError" class="error-msg"></div>
+    <div id="regSuccess" class="success-msg"></div>
     <div class="field"><label>Логин</label><input id="regUser" type="text" placeholder="username"></div>
     <div class="field"><label>Пароль</label><input id="regPass" type="password" placeholder="минимум 4 символа"></div>
     <div class="field"><label>Повтор пароля</label><input id="regPass2" type="password" placeholder="повторите пароль"></div>
@@ -962,16 +1486,26 @@ body::after{content:'';position:fixed;width:600px;height:600px;border-radius:50%
     <div class="sidebar" id="sidebar">
       <div class="sidebar-header">
         <div class="sidebar-logo-icon">&#129432;</div>
-        <div><div class="sidebar-logo-name">AI-CICADA</div><div class="sidebar-logo-sub">Локальный ИИ</div></div>
+        <div><div class="sidebar-logo-name">AI-CICADA</div><div class="sidebar-logo-sub">v5.0</div></div>
       </div>
       <button class="btn-new-chat" onclick="newChat()">+ Новый чат</button>
-      <div class="sidebar-section-title">История</div>
-      <div class="history-list" id="historyList"></div>
+      <div class="sidebar-nav">
+        <button class="sidebar-nav-btn active" onclick="showPanel('chats')" id="navChats">Чаты</button>
+        <button class="sidebar-nav-btn" onclick="showPanel('memory')" id="navMemory">Память</button>
+      </div>
+      <div class="sidebar-panel active" id="panelChats">
+        <div class="sidebar-section-title">История</div>
+        <div class="history-list" id="historyList"></div>
+      </div>
+      <div class="sidebar-panel" id="panelMemory">
+        <div class="sidebar-section-title">Моя память</div>
+        <div id="memorySidebar"></div>
+      </div>
       <div class="sidebar-profile">
         <div class="profile-avatar" id="sidebarAvatar">?</div>
         <div class="profile-info">
           <div class="profile-name" id="sidebarName">—</div>
-          <div class="profile-role">SQLite</div>
+          <div class="profile-role" id="sidebarRole">SQLite</div>
         </div>
         <button class="btn-logout" onclick="showProfilePage()" title="Профиль">&#128100;</button>
         <button class="btn-logout" onclick="logout()" title="Выйти">&#x21E5;</button>
@@ -982,13 +1516,26 @@ body::after{content:'';position:fixed;width:600px;height:600px;border-radius:50%
       <div class="topbar">
         <button class="btn-menu" onclick="openSidebar()">&#9776;</button>
         <div class="topbar-title" id="chatTitle">AI-CICADA</div>
+        <div class="tools-bar">
+          <button class="btn-icon" id="webSearchBtn" onclick="openSearch()" title="Web Search">&#128270;</button>
+          <button class="btn-icon" id="memoryBtn" onclick="openMemory()" title="Memory">&#129504;</button>
+          <button class="btn-icon" id="toolsBtn" onclick="toggleTools()" title="Tools">&#129522;</button>
+        </div>
         <div class="model-badge" id="modelBadge">загрузка...</div>
         <div class="status-indicator" id="statusDot"></div>
       </div>
+      <div id="toolBar" style="display:none;padding:8px 16px;background:var(--bg2);border-bottom:1px solid var(--border)">
+        <div style="font-size:11px;color:var(--text3);margin-bottom:8px">Доступные инструменты:</div>
+        <div id="toolBadges"></div>
+      </div>
       <div id="messages"></div>
       <div class="input-area">
+        <div class="input-toolbar">
+          <span class="tool-badge" id="webSearchBadge" style="display:none">&#128270; Web Search</span>
+          <span class="tool-badge" id="memoryBadge" style="display:none">&#129504; Memory</span>
+        </div>
         <div class="input-wrap">
-          <textarea id="input" rows="1" placeholder="Спросите что угодно..."></textarea>
+          <textarea id="input" rows="1" placeholder="Спросите что угодно... (ИИ может использовать инструменты автоматически)"></textarea>
           <button id="sendBtn" onclick="send()">&#10148;</button>
         </div>
       </div>
@@ -1003,12 +1550,13 @@ body::after{content:'';position:fixed;width:600px;height:600px;border-radius:50%
       <div>
         <div class="profile-big-name" id="profileName">—</div>
         <div class="profile-big-sub" id="profileSub">Локальный аккаунт</div>
-        <div class="db-badge">&#128190; SQLite</div>
+        <div class="db-badge">&#129504; SQLite + Tools + Memory</div>
       </div>
     </div>
     <div class="stats-grid">
       <div class="stat-card"><div class="stat-value" id="statChats">0</div><div class="stat-label">Чатов</div></div>
       <div class="stat-card"><div class="stat-value" id="statMsgs">0</div><div class="stat-label">Сообщений</div></div>
+      <div class="stat-card"><div class="stat-value" id="statMemory">0</div><div class="stat-label">Память</div></div>
       <div class="stat-card"><div class="stat-value" id="statDays">0</div><div class="stat-label">Дней</div></div>
     </div>
     <div class="info-section">
@@ -1031,6 +1579,8 @@ var currentModel = '';
 var currentChatId = null;
 var chatHistory   = [];
 var generating    = false;
+var availableTools = [];
+var toolsEnabled  = true;
 
 var API = {
     _post: function(url, data) {
@@ -1045,7 +1595,15 @@ var API = {
     upsertChat: function(id,u,t){ return API._post('/api/chats', { chatId:id, username:u, title:t }); },
     deleteChat: function(id)   { return API._del('/api/chats/' + encodeURIComponent(id)); },
     getMsgs:  function(id)     { return API._get('/api/messages/' + encodeURIComponent(id)); },
-    addMsg:   function(id,r,c,u){ return API._post('/api/messages', { chatId:id, role:r, content:c, username:u }); }
+    addMsg:   function(id,r,c,u){ return API._post('/api/messages', { chatId:id, role:r, content:c, username:u }); },
+    // Memory API
+    getMemory: function(u)     { return API._get('/api/memory?user=' + encodeURIComponent(u)); },
+    setMemory: function(u,k,v,cat){ return API._post('/api/memory', { username:u, key:k, value:v, category:cat }); },
+    delMemory: function(u,k)    { return API._del('/api/memory/' + encodeURIComponent(k) + '?user=' + encodeURIComponent(u)); },
+    // Search & Tools API
+    search:   function(q, max) { return API._post('/api/search', { query:q, max_results:max||5 }); },
+    tools:    function()       { return API._get('/api/tools'); },
+    execTool: function(name,u,args){ return API._post('/api/tool', { tool:name, username:u, arguments:args }); }
 };
 
 var Session = {
@@ -1059,10 +1617,22 @@ function showPage(id) {
     document.getElementById(id).classList.remove('hidden');
 }
 
+function showPanel(panel) {
+    document.querySelectorAll('.sidebar-panel').forEach(function(p){ p.classList.remove('active'); });
+    document.querySelectorAll('.sidebar-nav-btn').forEach(function(b){ b.classList.remove('active'); });
+    document.getElementById('panel' + panel.charAt(0).toUpperCase() + panel.slice(1)).classList.add('active');
+    document.getElementById('nav' + panel.charAt(0).toUpperCase() + panel.slice(1)).classList.add('active');
+    if (panel === 'memory') loadMemorySidebar();
+}
+
 function showError(id, msg) {
     var el = document.getElementById(id);
-    el.textContent = msg; el.classList.add('show');
-    setTimeout(function(){ el.classList.remove('show'); }, 3000);
+    if (el) { el.textContent = msg; el.classList.add('show'); setTimeout(function(){ el.classList.remove('show'); }, 3000); }
+}
+
+function showSuccess(id, msg) {
+    var el = document.getElementById(id);
+    if (el) { el.textContent = msg; el.classList.add('show'); setTimeout(function(){ el.classList.remove('show'); }, 2000); }
 }
 
 function login() {
@@ -1085,10 +1655,13 @@ function register() {
     if (p !== p2) return showError('regError', 'Пароли не совпадают');
     API.register(u, p).then(function(res) {
         if (res.error) return showError('regError', res.error);
-        API.login(u, p).then(function(r2) {
-            if (r2.error) return showPage('loginPage');
-            currentUser = r2; Session.set(u); enterChat();
-        });
+        showSuccess('regSuccess', 'Аккаунт создан! Вход...');
+        setTimeout(function(){
+            API.login(u, p).then(function(r2) {
+                if (r2.error) return showPage('loginPage');
+                currentUser = r2; Session.set(u); enterChat();
+            });
+        }, 1000);
     });
 }
 
@@ -1102,12 +1675,16 @@ function logout() {
 function enterChat() {
     updateSidebarProfile();
     renderHistoryList();
+    loadMemorySidebar();
     newChat();
     showPage('chatPage');
     fetch('/model').then(function(r){ return r.json(); }).then(function(d){
         currentModel = d.model;
+        availableTools = d.tools || [];
         document.getElementById('modelBadge').textContent = d.model;
         document.getElementById('statusDot').className = 'status-indicator online';
+        document.getElementById('sidebarRole').textContent = d.web_search ? 'SQLite + Web' : 'SQLite';
+        renderToolBadges();
     }).catch(function(){
         document.getElementById('modelBadge').textContent = 'Офлайн';
     });
@@ -1131,13 +1708,13 @@ function resetMessages() {
     var m = document.getElementById('messages');
     m.innerHTML = '<div class="welcome" id="welcomeBlock">' +
         '<div class="welcome-cicada">&#129432;</div>' +
-        '<h1>AI-CICADA</h1>' +
-        '<p>Локальный ИИ работает прямо на вашем устройстве.</p>' +
+        '<h1>AI-CICADA v5</h1>' +
+        '<p>Локальный ИИ с памятью, поиском и инструментами</p>' +
         '<div class="welcome-chips">' +
-        '<div class="chip" onclick="useChip(this)">Напиши скрипт на Python</div>' +
-        '<div class="chip" onclick="useChip(this)">Объясни как работает</div>' +
-        '<div class="chip" onclick="useChip(this)">Найди ошибку в коде</div>' +
-        '<div class="chip" onclick="useChip(this)">Помоги с задачей</div>' +
+        '<div class="chip" onclick="useChip(this)">Найди в интернете...</div>' +
+        '<div class="chip" onclick="useChip(this)">Запомни: мне нравится...</div>' +
+        '<div class="chip" onclick="useChip(this)">Сколько будет 15 * 23?</div>' +
+        '<div class="chip" onclick="useChip(this)">Напиши скрипт</div>' +
         '</div></div>';
 }
 
@@ -1192,6 +1769,119 @@ function renderHistoryList() {
     });
 }
 
+// ====== WEB SEARCH ======
+function openSearch() {
+    document.getElementById('searchOverlay').classList.add('show');
+    document.getElementById('searchInput').focus();
+}
+function closeSearch(e) {
+    if (e && e.target.id !== 'searchOverlay') return;
+    document.getElementById('searchOverlay').classList.remove('show');
+}
+function doSearch() {
+    var q = document.getElementById('searchInput').value.trim();
+    if (!q) return;
+    var resultsDiv = document.getElementById('searchResults');
+    resultsDiv.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text2)">Поиск...</div>';
+    API.search(q, 5).then(function(res) {
+        if (res.error) {
+            resultsDiv.innerHTML = '<div style="color:var(--accent3)">' + res.error + '</div>';
+            return;
+        }
+        if (!res.results || !res.results.length) {
+            resultsDiv.innerHTML = '<div style="color:var(--text2)">Ничего не найдено</div>';
+            return;
+        }
+        resultsDiv.innerHTML = res.results.map(function(r) {
+            return '<div class="search-result">' +
+                '<div class="search-result-title">' + escHtml(r.title) + '</div>' +
+                '<div class="search-result-url">' + escHtml(r.url) + '</div>' +
+                '<div class="search-result-snippet">' + (r.snippet || '') + '</div>' +
+                '</div>';
+        }).join('');
+        // Add search results to context
+        var searchContext = 'Результаты поиска по запросу "' + q + '":\n' + res.results.map(function(r, i) {
+            return (i+1) + '. ' + r.title + ' - ' + r.url;
+        }).join('\n');
+        document.getElementById('input').value = 'На основе этой информации: ' + q;
+    });
+}
+
+// ====== MEMORY ======
+function openMemory() {
+    document.getElementById('memoryOverlay').classList.add('show');
+    loadMemoryList();
+}
+function closeMemory(e) {
+    if (e && e.target.id !== 'memoryOverlay') return;
+    document.getElementById('memoryOverlay').classList.remove('show');
+}
+function saveMemory() {
+    var k = document.getElementById('memKey').value.trim();
+    var v = document.getElementById('memValue').value.trim();
+    var c = document.getElementById('memCat').value.trim() || 'general';
+    if (!k || !v) return alert('Заполните ключ и значение');
+    if (!currentUser) return;
+    API.setMemory(currentUser.username, k, v, c).then(function(res) {
+        if (res.ok) {
+            document.getElementById('memKey').value = '';
+            document.getElementById('memValue').value = '';
+            loadMemoryList();
+            loadMemorySidebar();
+        }
+    });
+}
+function loadMemoryList() {
+    if (!currentUser) return;
+    API.getMemory(currentUser.username).then(function(res) {
+        var list = document.getElementById('memoryList');
+        if (!res.memory || !res.memory.length) {
+            list.innerHTML = '<div style="color:var(--text3);text-align:center;padding:20px">Нет сохранённых воспоминаний</div>';
+            return;
+        }
+        list.innerHTML = res.memory.map(function(m) {
+            return '<div class="memory-item" onclick="useMemory(\'' + m.key + '\')">' +
+                '<div class="memory-item-key">' + escHtml(m.key) + '</div>' +
+                '<div class="memory-item-value">' + escHtml(m.value) + '</div>' +
+                '<div class="memory-item-cat">' + (m.category || 'general') + '</div>' +
+                '</div>';
+        }).join('');
+    });
+}
+function loadMemorySidebar() {
+    if (!currentUser) return;
+    API.getMemory(currentUser.username).then(function(res) {
+        var sidebar = document.getElementById('memorySidebar');
+        if (!res.memory || !res.memory.length) {
+            sidebar.innerHTML = '<div style="color:var(--text3);text-align:center;padding:20px;font-size:12px">Нет воспоминаний</div>';
+            return;
+        }
+        sidebar.innerHTML = res.memory.slice(0, 10).map(function(m) {
+            return '<div class="memory-item" onclick="useMemory(\'' + m.key + '\')">' +
+                '<div class="memory-item-key">' + escHtml(m.key) + '</div>' +
+                '<div class="memory-item-value">' + escHtml(m.value.slice(0, 50)) + (m.value.length > 50 ? '...' : '') + '</div>' +
+                '</div>';
+        }).join('');
+    });
+}
+function useMemory(key) {
+    document.getElementById('input').value = 'Что ты помнишь про: ' + key;
+    closeMemory();
+}
+
+// ====== TOOLS ======
+function toggleTools() {
+    var bar = document.getElementById('toolBar');
+    bar.style.display = bar.style.display === 'none' ? 'block' : 'none';
+}
+function renderToolBadges() {
+    var badges = document.getElementById('toolBadges');
+    badges.innerHTML = availableTools.map(function(t) {
+        return '<span class="tool-badge">' + t + '</span>';
+    }).join('');
+}
+
+// ====== CHAT WITH TOOLS ======
 function send() {
     var text = document.getElementById('input').value.trim();
     if (!text || generating) return;
@@ -1212,7 +1902,13 @@ function send() {
     var typingEl = addTyping();
     var fullText = '';
     var aiBubble = null;
-    fetch('/chat', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ messages: chatHistory }) })
+    var toolCalls = [];
+    
+    fetch('/chat', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ 
+        messages: chatHistory, 
+        username: currentUser ? currentUser.username : null,
+        tools: toolsEnabled 
+    }) })
     .then(function(res) {
         var reader = res.body.getReader();
         var dec = new TextDecoder();
@@ -1228,10 +1924,25 @@ function send() {
                         if (json.error) throw new Error(json.error);
                         if (json.text) {
                             fullText += json.text;
+                            // Check for tool call in JSON format
+                            if (fullText.includes('"tool":')) {
+                                try {
+                                    var toolCall = JSON.parse(fullText);
+                                    if (toolCall.tool && toolCall.arguments) {
+                                        toolCalls.push(toolCall);
+                                        fullText = '';
+                                        if (aiBubble) {
+                                            aiBubble.querySelector('.bubble').innerHTML = '<div style="color:var(--accent2)">&#129522; Выполняю: ' + toolCall.tool + '...</div>';
+                                        }
+                                    }
+                                } catch(e) {}
+                            }
                             if (!aiBubble) { typingEl.remove(); aiBubble = addMsg('ai', ''); }
                             var bubble = aiBubble.querySelector('.bubble');
-                            bubble.innerHTML = '';
-                            bubble.appendChild(renderMd(fullText));
+                            if (!toolCalls.length) {
+                                bubble.innerHTML = '';
+                                bubble.appendChild(renderMd(fullText));
+                            }
                             document.getElementById('messages').scrollTop = 999999;
                         }
                     } catch(e) {}
@@ -1241,9 +1952,70 @@ function send() {
         }
         return read();
     })
-    .catch(function(err) { typingEl.remove(); addMsg('ai', 'Ошибка: ' + err.message); })
+    .then(function() {
+        // Execute any tool calls
+        if (toolCalls.length && currentUser) {
+            var lastTool = toolCalls[toolCalls.length - 1];
+            return API.execTool(lastTool.tool, currentUser.username, lastTool.arguments);
+        }
+    })
+    .then(function(toolResult) {
+        if (toolResult) {
+            // Add tool result to chat
+            var resultText = JSON.stringify(toolResult, null, 2);
+            if (toolResult.results) {
+                resultText = toolResult.results.map(function(r) { return r.title + ': ' + r.url; }).join('\n');
+            } else if (toolResult.message) {
+                resultText = toolResult.message;
+            } else if (toolResult.result !== undefined) {
+                resultText = 'Результат: ' + toolResult.result;
+            }
+            chatHistory.push({ role: 'system', content: 'Результат инструмента: ' + resultText });
+            // Continue chat with tool result
+            return fetch('/chat', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ 
+                messages: chatHistory,
+                username: currentUser ? currentUser.username : null,
+                tools: false
+            })});
+        }
+    })
+    .then(function(contRes) {
+        if (contRes && contRes.body) {
+            var reader = contRes.body.getReader();
+            var dec = new TextDecoder();
+            var contText = '';
+            var contBubble = null;
+            function readCont() {
+                return reader.read().then(function(x) {
+                    if (x.done) return;
+                    var lines = dec.decode(x.value).split('\n').filter(function(l){ return l.indexOf('data: ') === 0; });
+                    lines.forEach(function(line) {
+                        var data = line.slice(6);
+                        if (data === '[DONE]') return;
+                        try {
+                            var json = JSON.parse(data);
+                            if (json.text) {
+                                contText += json.text;
+                                if (!contBubble) { contBubble = addMsg('ai', ''); }
+                                var bubble = contBubble.querySelector('.bubble');
+                                bubble.innerHTML = '';
+                                bubble.appendChild(renderMd(contText));
+                                document.getElementById('messages').scrollTop = 999999;
+                            }
+                        } catch(e) {}
+                    });
+                    return readCont();
+                });
+            }
+            return readCont();
+        }
+    })
+    .catch(function(err) { 
+        if (!aiBubble) typingEl.remove(); 
+        if (err.message) addMsg('ai', 'Ошибка: ' + err.message); 
+    })
     .finally(function() {
-        if (fullText && currentUser) {
+        if (fullText && currentUser && !toolCalls.length) {
             chatHistory.push({ role: 'assistant', content: fullText });
             API.addMsg(currentChatId, 'assistant', fullText, currentUser.username);
             saveCurrentChat(chatHistory[0] ? chatHistory[0].content : 'Чат');
@@ -1261,7 +2033,7 @@ function addMsg(role, text) {
     div.className = 'msg ' + (role === 'user' ? 'user' : 'ai');
     var av = document.createElement('div');
     av.className = 'avatar';
-    av.textContent = role === 'user' ? (currentUser ? currentUser.username[0].toUpperCase() : 'Я') : '\u{1F99F}';
+    av.textContent = role === 'user' ? (currentUser ? currentUser.username[0].toUpperCase() : 'Я') : (role === 'system' ? '&#129522;' : '&#129432;');
     var bubble = document.createElement('div');
     bubble.className = 'bubble';
     if (text) bubble.appendChild(renderMd(text));
@@ -1319,7 +2091,7 @@ function showProfilePage() {
     API.stats(currentUser.username).then(function(stats) {
         document.getElementById('profileAvatar').textContent = currentUser.username[0].toUpperCase();
         document.getElementById('profileName').textContent   = currentUser.username;
-        document.getElementById('profileSub').textContent    = 'AI-CICADA · SQLite';
+        document.getElementById('profileSub').textContent    = 'AI-CICADA v5 · +Tools +Memory';
         document.getElementById('infoUser').textContent      = currentUser.username;
         document.getElementById('infoModel').textContent     = currentModel || '—';
         var d = stats.created_at ? new Date(stats.created_at * 1000) : new Date();
@@ -1327,6 +2099,7 @@ function showProfilePage() {
         var days = Math.max(1, Math.floor((Date.now() - d.getTime()) / 86400000));
         document.getElementById('statChats').textContent = stats.chat_count || 0;
         document.getElementById('statMsgs').textContent  = stats.msg_count  || 0;
+        document.getElementById('statMemory').textContent = stats.memory_count || 0;
         document.getElementById('statDays').textContent  = days;
         showPage('profilePage');
         closeSidebar();
@@ -1398,7 +2171,7 @@ create_web_chat() {
 setup_alias() {
     printf "${BLUE}Setting up commands...${NC}\n"
     local SHELLRC="$HOME/.bashrc"
-    if [ "$ENV_TYPE" = "homeassistant" ] || [ "$ENV_TYPE" = "alpine" ]; then
+    if [ "$ENV_TYPE" = "homeassistant" ] || [ "$ENV_TYPE" = "alpine" ] || [ "$ENV_TYPE" = "wsl-ha" ]; then
         if [ -f "$HOME/.bashrc" ]; then SHELLRC="$HOME/.bashrc";
         else SHELLRC="$HOME/.profile"; fi
     fi
@@ -1426,7 +2199,8 @@ web() {
         ollama serve > /dev/null 2>&1 &
         sleep 3
     fi
-    CHAT_IP=\$(hostname -I 2>/dev/null | awk '{print \$1}' || echo "localhost")
+    # Cross-platform IP detection (works on WSL, Termux, HA, Linux)
+    CHAT_IP=\$(ip route get 1 2>/dev/null | awk '{for(i=1;i<=NF;i++)if(\$i=="src"){print \$(i+1);exit}}' || hostname -I 2>/dev/null | awk '{print \$1}' || echo "localhost")
     printf "Web chat: http://\${CHAT_IP}:3000\n"
     AI_MODEL=\$AI_MODEL node \$AI_CICADA_DIR/server.js
 }
@@ -1443,7 +2217,7 @@ ALIASEOF
 }
 
 show_ha_tips() {
-    if [ "$ENV_TYPE" != "homeassistant" ]; then return; fi
+    if [ "$ENV_TYPE" != "homeassistant" ] && [ "$ENV_TYPE" != "wsl-ha" ]; then return; fi
     clear
     center_text "${GREEN}Home Assistant - советы${NC}"
     printf "\n"
@@ -1463,14 +2237,28 @@ show_ha_tips() {
 
 final_screen() {
     clear
+    # Cross-platform IP detection
     local CHAT_HOST
-    CHAT_HOST=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "localhost")
+    CHAT_HOST=$(ip route get 1 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="src"){print $(i+1);exit}}' || hostname -I 2>/dev/null | awk '{print $1}' || echo "localhost")
+    local display_env="$ENV_TYPE"
+    case "$ENV_TYPE" in
+        wsl|wsl-ha) display_env="WSL (Windows)" ;;
+        homeassistant) display_env="Home Assistant" ;;
+        termux) display_env="Termux (Android)" ;;
+        debian) display_env="Debian/Ubuntu" ;;
+        fedora) display_env="Fedora" ;;
+        arch) display_env="Arch Linux" ;;
+        alpine) display_env="Alpine Linux" ;;
+        opensuse) display_env="openSUSE" ;;
+        void) display_env="Void Linux" ;;
+    esac
     draw_box \
         "INSTALLATION COMPLETE" \
         "" \
-        "Platform : $ENV_TYPE" \
+        "Platform : $display_env" \
         "Model    : $MODEL" \
         "DB       : $CHAT_DIR/cicada.db" \
+        "Features : +Tools +Memory +WebSearch" \
         "" \
         "  web   -- http://${CHAT_HOST}:3000" \
         "  ai    -- terminal agent" \
@@ -1490,8 +2278,9 @@ launch_choice() {
     draw_box "1) Browser chat (web)" "2) Terminal agent (ai)" "3) Exit"
     printf "\n${YELLOW}Choice: ${NC}"
     read -r ch </dev/tty
+    # Cross-platform IP detection
     local CHAT_HOST
-    CHAT_HOST=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "localhost")
+    CHAT_HOST=$(ip route get 1 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="src"){print $(i+1);exit}}' || hostname -I 2>/dev/null | awk '{print $1}' || echo "localhost")
     case $ch in
         1)
             if ! pgrep -x "ollama" > /dev/null 2>&1; then ollama serve >> "$LOG_FILE" 2>&1 & sleep 3; fi

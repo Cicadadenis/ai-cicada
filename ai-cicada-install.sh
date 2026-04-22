@@ -1531,7 +1531,7 @@ var currentChatId = null;
 var chatHistory   = [];
 var generating    = false;
 var availableTools = [];
-var toolsEnabled  = true;
+var toolsEnabled  = false;
 
 var API = {
     _post: function(url, data) {
@@ -1855,7 +1855,10 @@ function send() {
     var aiBubble = null;
     var toolCalls = [];
     
-    fetch('/chat', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ 
+    var abortCtrl = new AbortController();
+    var abortTimer = setTimeout(function() { abortCtrl.abort(); }, 120000); // 2 min timeout
+
+    fetch('/chat', { method:'POST', headers:{'Content-Type':'application/json'}, signal: abortCtrl.signal, body: JSON.stringify({ 
         messages: chatHistory, 
         username: currentUser ? currentUser.username : null,
         tools: toolsEnabled 
@@ -1967,9 +1970,16 @@ function send() {
     })
     .catch(function(err) { 
         if (!aiBubble) typingEl.remove(); 
-        if (err.message) addMsg('ai', 'Ошибка: ' + err.message); 
+        if (err.message && err.message !== 'AbortError') addMsg('ai', 'Ошибка: ' + err.message); 
     })
     .finally(function() {
+        clearTimeout(abortTimer);
+        // If bubble is stuck on "Обрабатываю..." (JSON that never became a tool call), show real text
+        if (aiBubble && !toolCalls.length && fullText) {
+            var bubble = aiBubble.querySelector('.bubble');
+            bubble.innerHTML = '';
+            bubble.appendChild(renderMd(fullText));
+        }
         if (fullText && currentUser && !toolCalls.length) {
             chatHistory.push({ role: 'assistant', content: fullText });
             API.addMsg(currentChatId, 'assistant', fullText, currentUser.username);

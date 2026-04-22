@@ -157,7 +157,9 @@ spinner() {
         local temp=${spin#?}
         printf "\r${BLUE}[%c] Processing...${NC}" "$spin"
         spin=$temp${spin%"$temp"}
-        sleep 0.1
+        # Use bash built-in read -t instead of sleep to avoid
+        # "libpcre2-8.so not found" errors on broken Termux installs
+        read -r -t 0.1 _ 2>/dev/null </dev/null || true
     done
     printf "\r%-30s\r" " "
 }
@@ -282,6 +284,17 @@ select_model() {
     printf "\n${GREEN}✓ Выбрана модель: $MODEL${NC}\n"
     sleep 1
     clear
+}
+
+fix_termux_libs() {
+    [ "$ENV_TYPE" != "termux" ] && return
+    # Test if external binaries link correctly (libpcre2-8.so issue)
+    if ! (sleep 0 >/dev/null 2>&1); then
+        printf "${YELLOW}⚠  Termux: broken libpcre2, fixing...${NC}\n"
+        # pkg itself may work even when sleep doesn't
+        pkg install -y pcre2 2>&1 | tail -3 || true
+        printf "${GREEN}✓ pcre2 installed, continuing...${NC}\n"
+    fi
 }
 
 fix_dpkg_termux() {
@@ -2243,6 +2256,7 @@ launch_choice() {
 main() {
     echo "===== AI-CICADA INSTALL $(date) =====" > "$LOG_FILE"
     detect_env
+    fix_termux_libs
     show_logo
     select_model
     update_system; clear

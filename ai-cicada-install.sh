@@ -157,8 +157,6 @@ spinner() {
         local temp=${spin#?}
         printf "\r${BLUE}[%c] Processing...${NC}" "$spin"
         spin=$temp${spin%"$temp"}
-        # Use bash built-in read -t instead of sleep to avoid
-        # "libpcre2-8.so not found" errors on broken Termux installs
         read -r -t 0.1 _ 2>/dev/null </dev/null || true
     done
     printf "\r%-30s\r" " "
@@ -288,12 +286,10 @@ select_model() {
 
 fix_termux_libs() {
     [ "$ENV_TYPE" != "termux" ] && return
-    # Test if external binaries link correctly (libpcre2-8.so issue)
     if ! (sleep 0 >/dev/null 2>&1); then
         printf "${YELLOW}⚠  Termux: broken libpcre2, fixing...${NC}\n"
-        # pkg itself may work even when sleep doesn't
         pkg install -y pcre2 2>&1 | tail -3 || true
-        printf "${GREEN}✓ pcre2 installed, continuing...${NC}\n"
+        printf "${GREEN}✓ pcre2 fixed${NC}\n"
     fi
 }
 
@@ -395,20 +391,12 @@ install_python() {
     if [ "$ENV_TYPE" != "termux" ]; then return; fi
     printf "${BLUE}Checking Python3 (Termux)...${NC}\n"
     if command -v python3 >/dev/null 2>&1; then
-        printf "${GREEN}Python3 already installed (%s)${NC}\n" "$(python3 --version 2>&1)"
-        return
+        printf "${GREEN}Python3 already installed (%s)${NC}\n" "$(python3 --version 2>&1)"; return
     fi
-    printf "${BLUE}Installing Python3...${NC}\n"
     timer_start
-    (yes N | pkg install -y python >> "$LOG_FILE" 2>&1) &
-    spinner $!
+    (yes N | pkg install -y python >> "$LOG_FILE" 2>&1) & spinner $!
     timer_end
-    if command -v python3 >/dev/null 2>&1; then
-        printf "${GREEN}Python3 installed: %s${NC}\n" "$(python3 --version 2>&1)"
-    else
-        printf "${RED}Python3 installation failed. Check %s${NC}\n" "$LOG_FILE"
-        exit 1
-    fi
+    command -v python3 >/dev/null 2>&1 && printf "${GREEN}Python3 ready${NC}\n" || { printf "${RED}Python3 failed${NC}\n"; exit 1; }
 }
 
 install_ollama() {
@@ -452,9 +440,9 @@ install_ollama() {
             spinner $!
             ;;
         wsl)
-            printf "${YELLOW}WSL detected: using standard Ollama installer...${NC}\n"
+            printf "${YELLOW}WSL: installing Ollama...${NC}\n"
             if ! command -v zstd >/dev/null 2>&1; then
-                printf "${BLUE}Installing zstd (required for Ollama extraction)...${NC}\n"
+                printf "${BLUE}Installing zstd...${NC}\n"
                 sudo DEBIAN_FRONTEND=noninteractive apt install -y zstd >> "$LOG_FILE" 2>&1
             fi
             curl -fsSL https://ollama.com/install.sh | sh >> "$LOG_FILE" 2>&1 &
@@ -1178,6 +1166,8 @@ server.listen(PORT, '0.0.0.0', function() {
     console.log('Open   : http://localhost:' + PORT);
     console.log('\nPress Ctrl+C to stop\n');
 });
+process.on('uncaughtException', function(err) { console.error('[uncaughtException]', err.message); });
+process.on('unhandledRejection', function(r) { console.error('[unhandledRejection]', r); });
 """
 
 with open(path, 'w') as f:
@@ -1881,15 +1871,15 @@ function send() {
                         if (json.error) throw new Error(json.error);
                         if (json.text) {
                             fullText += json.text;
-                            // Check for tool call in JSON format
-                            if (fullText.includes('"tool":')) {
+                            var trimmed = fullText.trim();
+                            if (trimmed.startsWith('{') && trimmed.includes('"tool":')) {
                                 try {
-                                    var toolCall = JSON.parse(fullText);
+                                    var toolCall = JSON.parse(trimmed);
                                     if (toolCall.tool && toolCall.arguments) {
                                         toolCalls.push(toolCall);
                                         fullText = '';
                                         if (aiBubble) {
-                                            aiBubble.querySelector('.bubble').innerHTML = '<div style="color:var(--accent2)">&#129522; Выполняю: ' + toolCall.tool + '...</div>';
+                                            aiBubble.querySelector('.bubble').innerHTML = '<div style="color:var(--accent2)">&#129518; Выполняю: ' + toolCall.tool + '...</div>';
                                         }
                                     }
                                 } catch(e) {}
@@ -1898,7 +1888,11 @@ function send() {
                             var bubble = aiBubble.querySelector('.bubble');
                             if (!toolCalls.length) {
                                 bubble.innerHTML = '';
-                                bubble.appendChild(renderMd(fullText));
+                                if (fullText.trim().startsWith('{')) {
+                                    bubble.innerHTML = '<div style="color:var(--accent2)">&#129518; Обрабатываю...</div>';
+                                } else {
+                                    bubble.appendChild(renderMd(fullText));
+                                }
                             }
                             document.getElementById('messages').scrollTop = 999999;
                         }
@@ -2142,15 +2136,18 @@ export AI_MODEL="$MODEL"
 export AI_CICADA_DIR="$CHAT_DIR"
 
 ai() {
+    set +e
     if ! pgrep -x "ollama" > /dev/null 2>&1; then
         printf "Starting Ollama...\n"
         ollama serve > /dev/null 2>&1 &
         sleep 3
     fi
-    CLAUDE_CODE_USE_OPENAI=1 OPENAI_BASE_URL=http://localhost:11434/v1 OPENAI_MODEL=\$AI_MODEL openclaude
+    ollama run \$AI_MODEL
+    set -e 2>/dev/null || true
 }
 
 web() {
+    set +e
     if ! pgrep -x "ollama" > /dev/null 2>&1; then
         printf "Starting Ollama...\n"
         ollama serve > /dev/null 2>&1 &
@@ -2159,7 +2156,10 @@ web() {
     # Cross-platform IP detection (works on WSL, Termux, HA, Linux)
     CHAT_IP=\$(ip route get 1 2>/dev/null | awk '{for(i=1;i<=NF;i++)if(\$i=="src"){print \$(i+1);exit}}' || hostname -I 2>/dev/null | awk '{print \$1}' || echo "localhost")
     printf "Web chat: http://\${CHAT_IP}:3000\n"
-    AI_MODEL=\$AI_MODEL node \$AI_CICADA_DIR/server.js
+    AI_MODEL=\$AI_MODEL node \$AI_CICADA_DIR/server.js || {
+        printf "Error: server crashed (exit \$?). Check logs.\n"
+    }
+    set -e 2>/dev/null || true
 }
 
 aidb() {
@@ -2247,7 +2247,7 @@ launch_choice() {
             ;;
         2)
             if ! pgrep -x "ollama" > /dev/null 2>&1; then ollama serve >> "$LOG_FILE" 2>&1 & sleep 3; fi
-            CLAUDE_CODE_USE_OPENAI=1 OPENAI_BASE_URL=http://localhost:11434/v1 OPENAI_MODEL="$MODEL" openclaude
+            ollama run "$MODEL"
             ;;
         *) printf "${GREEN}Done! Run 'ai' or 'web' anytime.${NC}\n" ;;
     esac

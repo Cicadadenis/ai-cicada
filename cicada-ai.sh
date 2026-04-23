@@ -644,18 +644,19 @@ install_npm_deps() {
     cat > package.json << 'PKGEOF'
 {
   "name": "ai-cicada",
-  "version": "5.0.0",
+  "version": "5.1.0",
   "main": "server.js",
   "dependencies": {
     "better-sqlite3": "^9.4.3",
-    "axios": "^1.6.0"
+    "axios": "^1.6.0",
+    "jsonwebtoken": "^9.0.2"
   }
 }
 PKGEOF
-    (npm install --save better-sqlite3 axios >> "$LOG_FILE" 2>&1) &
+    (npm install >> "$LOG_FILE" 2>&1) &
     spinner $!
     if [ -d "$CHAT_DIR/node_modules/better-sqlite3" ]; then
-        printf "${GREEN}better-sqlite3 installed${NC}\n"
+        printf "${GREEN}Dependencies installed${NC}\n"
         DB_FALLBACK=0
     else
         printf "${YELLOW}better-sqlite3 failed, using in-memory fallback${NC}\n"
@@ -682,6 +683,11 @@ const https  = require('https');
 const PORT       = 3000;
 const MODEL      = process.env.AI_MODEL || 'qwen2.5-coder:3b';
 const DB_PATH    = path.join(__dirname, 'cicada.db');
+const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
+const JWT_EXPIRY = process.env.JWT_EXPIRY || '7d';
+
+let jwt = null;
+try { jwt = require('jsonwebtoken'); } catch(e) { console.log('jsonwebtoken not available, using simple auth'); }
 let axios = null;
 try { axios = require('axios'); } catch(e) { console.log('axios not available, web search disabled'); }
 
@@ -917,6 +923,52 @@ function searchMemory(username, query) {
     return results;
 }
 
+/* ====== JWT Authentication ====== */
+function generateToken(username) {
+    if (!jwt) return null;
+    return jwt.sign({ username: username, iat: Math.floor(Date.now()/1000) }, JWT_SECRET, { expiresIn: JWT_EXPIRY });
+}
+
+function verifyToken(token) {
+    if (!jwt) return null;
+    try {
+        return jwt.verify(token, JWT_SECRET);
+    } catch(e) {
+        return null;
+    }
+}
+
+function authMiddleware(req, res, next) {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
+
+    if (!token) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Access token required' }));
+        return;
+    }
+
+    const decoded = verifyToken(token);
+    if (!decoded) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid or expired token' }));
+        return;
+    }
+
+    req.username = decoded.username;
+    next();
+}
+
+function optionalAuth(req, res, next) {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    if (token) {
+        const decoded = verifyToken(token);
+        if (decoded) req.username = decoded.username;
+    }
+    next();
+}
+
 /* ====== WEB SEARCH ====== */
 async function webSearch(query, maxResults) {
     maxResults = maxResults || 5;
@@ -1019,8 +1071,20 @@ async function executeTool(toolName, args, username) {
             return { results: searchMemory(username, args.query) };
         case 'calculate':
             try {
-                // Safe eval alternative
-                const result = Function('"use strict"; return (' + args.expression + ')')();
+                // Safe math evaluator - only allows numbers and basic operators
+                const sanitized = args.expression.replace(/[^0-9+\-*/().\s]/g, '');
+                if (sanitized.length === 0) {
+                    return { error: 'Invalid expression: only numbers and + - * / ( ) allowed' };
+                }
+                if (sanitized.length > 100) {
+                    return { error: 'Expression too long' };
+                }
+                // Use Function with strict mode but sanitized input
+                const result = Function('"use strict"; return (' + sanitized + ')')();
+                // Validate result is a number
+                if (typeof result !== 'number' || !isFinite(result)) {
+                    return { error: 'Invalid result type' };
+                }
                 return { result: result, expression: args.expression };
             } catch(e) {
                 return { error: 'Calculation failed: ' + e.message };
@@ -1111,83 +1175,136 @@ const server = http.createServer(async function(req, res) {
             if (!getUser(username)) return jsonErr(res, 404, 'Пользователь не найден');
             if (!checkPassword(username, password)) return jsonErr(res, 401, 'Неверный пароль');
             const stats = getUserStats(username);
-            return jsonOk(res, Object.assign({ ok: true, username: username }, stats));
+            const token = generateToken(username);
+            return jsonOk(res, Object.assign({ ok: true, username: username, token: token }, stats));
         } catch(e) { return jsonErr(res, 400, e.message); }
     }
 
     if (req.method === 'GET' && url === '/api/stats') {
-        const username = new URLSearchParams(req.url.split('?')[1] || '').get('user');
-        if (!username) return jsonErr(res, 400, 'user required');
-        return jsonOk(res, getUserStats(username));
+        const authHeader = req.headers['authorization'];
+        const token = authHeader && authHeader.split(' ')[1];
+        if (!token) return jsonErr(res, 401, 'Authorization required');
+        const decoded = verifyToken(token);
+        if (!decoded) return jsonErr(res, 403, 'Invalid token');
+        return jsonOk(res, getUserStats(decoded.username));
     }
 
     /* Chats */
     if (req.method === 'GET' && url === '/api/chats') {
-        const username = new URLSearchParams(req.url.split('?')[1] || '').get('user');
-        if (!username) return jsonErr(res, 400, 'user required');
-        return jsonOk(res, getUserChats(username));
+        const authHeader = req.headers['authorization'];
+        const token = authHeader && authHeader.split(' ')[1];
+        if (!token) return jsonErr(res, 401, 'Authorization required');
+        const decoded = verifyToken(token);
+        if (!decoded) return jsonErr(res, 403, 'Invalid token');
+        return jsonOk(res, getUserChats(decoded.username));
     }
 
     if (req.method === 'POST' && url === '/api/chats') {
         try {
+            const authHeader = req.headers['authorization'];
+            const token = authHeader && authHeader.split(' ')[1];
+            if (!token) return jsonErr(res, 401, 'Authorization required');
+            const decoded = verifyToken(token);
+            if (!decoded) return jsonErr(res, 403, 'Invalid token');
             const body = await parseBody(req);
-            if (!body.chatId || !body.username) return jsonErr(res, 400, 'chatId и username обязательны');
-            upsertChat(body.chatId, body.username, body.title || 'Новый чат');
+            if (!body.chatId) return jsonErr(res, 400, 'chatId обязателен');
+            upsertChat(body.chatId, decoded.username, body.title || 'Новый чат');
             return jsonOk(res, { ok: true });
         } catch(e) { return jsonErr(res, 400, e.message); }
     }
 
     if (req.method === 'DELETE' && url.startsWith('/api/chats/')) {
+        const authHeader = req.headers['authorization'];
+        const token = authHeader && authHeader.split(' ')[1];
+        if (!token) return jsonErr(res, 401, 'Authorization required');
+        const decoded = verifyToken(token);
+        if (!decoded) return jsonErr(res, 403, 'Invalid token');
         const chatId = url.slice('/api/chats/'.length);
         if (!chatId) return jsonErr(res, 400, 'chatId required');
+        // Verify ownership before deleting
+        const chats = getUserChats(decoded.username);
+        if (!chats.find(c => c.id === chatId)) return jsonErr(res, 403, 'Access denied');
         deleteChat(chatId);
         return jsonOk(res, { ok: true });
     }
 
     /* Messages */
     if (req.method === 'GET' && url.startsWith('/api/messages/')) {
+        const authHeader = req.headers['authorization'];
+        const token = authHeader && authHeader.split(' ')[1];
+        if (!token) return jsonErr(res, 401, 'Authorization required');
+        const decoded = verifyToken(token);
+        if (!decoded) return jsonErr(res, 403, 'Invalid token');
         const chatId = url.slice('/api/messages/'.length);
+        // Verify ownership
+        const chats = getUserChats(decoded.username);
+        if (!chats.find(c => c.id === chatId)) return jsonErr(res, 403, 'Access denied');
         return jsonOk(res, getChatMessages(chatId));
     }
 
     if (req.method === 'POST' && url === '/api/messages') {
         try {
+            const authHeader = req.headers['authorization'];
+            const token = authHeader && authHeader.split(' ')[1];
+            if (!token) return jsonErr(res, 401, 'Authorization required');
+            const decoded = verifyToken(token);
+            if (!decoded) return jsonErr(res, 403, 'Invalid token');
             const body = await parseBody(req);
             if (!body.chatId || !body.role || !body.content) return jsonErr(res, 400, 'chatId, role, content обязательны');
+            // Verify ownership
+            const chats = getUserChats(decoded.username);
+            if (!chats.find(c => c.id === body.chatId)) return jsonErr(res, 403, 'Access denied');
             addMessage(body.chatId, body.role, body.content);
-            if (body.role === 'assistant' && body.username) incUserMsgs(body.username);
+            if (body.role === 'assistant') incUserMsgs(decoded.username);
             return jsonOk(res, { ok: true });
         } catch(e) { return jsonErr(res, 400, e.message); }
     }
 
     /* Memory API */
     if (req.method === 'GET' && url === '/api/memory') {
-        const username = new URLSearchParams(req.url.split('?')[1] || '').get('user');
+        const authHeader = req.headers['authorization'];
+        const token = authHeader && authHeader.split(' ')[1];
+        if (!token) return jsonErr(res, 401, 'Authorization required');
+        const decoded = verifyToken(token);
+        if (!decoded) return jsonErr(res, 403, 'Invalid token');
         const category = new URLSearchParams(req.url.split('?')[1] || '').get('category');
-        if (!username) return jsonErr(res, 400, 'user required');
-        return jsonOk(res, { memory: getAllMemory(username, category) });
+        return jsonOk(res, { memory: getAllMemory(decoded.username, category) });
     }
 
     if (req.method === 'POST' && url === '/api/memory') {
         try {
+            const authHeader = req.headers['authorization'];
+            const token = authHeader && authHeader.split(' ')[1];
+            if (!token) return jsonErr(res, 401, 'Authorization required');
+            const decoded = verifyToken(token);
+            if (!decoded) return jsonErr(res, 403, 'Invalid token');
             const body = await parseBody(req);
-            if (!body.username || !body.key || !body.value) return jsonErr(res, 400, 'username, key, value required');
-            const saved = setMemory(body.username, body.key, body.value, body.category);
+            if (!body.key || !body.value) return jsonErr(res, 400, 'key, value required');
+            const saved = setMemory(decoded.username, body.key, body.value, body.category);
             return jsonOk(res, { ok: saved, key: body.key });
         } catch(e) { return jsonErr(res, 400, e.message); }
     }
 
     if (req.method === 'DELETE' && url.startsWith('/api/memory/')) {
+        const authHeader = req.headers['authorization'];
+        const token = authHeader && authHeader.split(' ')[1];
+        if (!token) return jsonErr(res, 401, 'Authorization required');
+        const decoded = verifyToken(token);
+        if (!decoded) return jsonErr(res, 403, 'Invalid token');
         const key = decodeURIComponent(url.slice('/api/memory/'.length));
-        const username = new URLSearchParams(req.url.split('?')[1] || '').get('user');
-        if (!username || !key) return jsonErr(res, 400, 'user and key required');
-        deleteMemory(username, key);
+        if (!key) return jsonErr(res, 400, 'key required');
+        deleteMemory(decoded.username, key);
         return jsonOk(res, { ok: true });
     }
 
     /* Web Search API */
     if (req.method === 'POST' && url === '/api/search') {
         try {
+            const authHeader = req.headers['authorization'];
+            const token = authHeader && authHeader.split(' ')[1];
+            if (!token) return jsonErr(res, 401, 'Authorization required');
+            const decoded = verifyToken(token);
+            if (!decoded) return jsonErr(res, 403, 'Invalid token');
             const body = await parseBody(req);
             if (!body.query) return jsonErr(res, 400, 'query required');
             const results = await webSearch(body.query, body.max_results || 5);
@@ -1198,9 +1315,14 @@ const server = http.createServer(async function(req, res) {
     /* Tools API */
     if (req.method === 'POST' && url === '/api/tool') {
         try {
+            const authHeader = req.headers['authorization'];
+            const token = authHeader && authHeader.split(' ')[1];
+            if (!token) return jsonErr(res, 401, 'Authorization required');
+            const decoded = verifyToken(token);
+            if (!decoded) return jsonErr(res, 403, 'Invalid token');
             const body = await parseBody(req);
-            if (!body.tool || !body.username) return jsonErr(res, 400, 'tool and username required');
-            const result = await executeTool(body.tool, body.arguments || {}, body.username);
+            if (!body.tool) return jsonErr(res, 400, 'tool required');
+            const result = await executeTool(body.tool, body.arguments || {}, decoded.username);
             return jsonOk(res, result);
         } catch(e) { return jsonErr(res, 500, e.message); }
     }
@@ -1211,6 +1333,19 @@ const server = http.createServer(async function(req, res) {
 
     /* Ollama stream with tool support */
     if (req.method === 'POST' && url === '/chat') {
+        const authHeader = req.headers['authorization'];
+        const token = authHeader && authHeader.split(' ')[1];
+        if (!token) {
+            res.writeHead(401, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Authorization required' }));
+            return;
+        }
+        const decoded = verifyToken(token);
+        if (!decoded) {
+            res.writeHead(403, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Invalid token' }));
+            return;
+        }
         var body = '';
         req.on('data', function(chunk) { body += chunk; });
         req.on('end', function() {
@@ -1219,7 +1354,7 @@ const server = http.createServer(async function(req, res) {
             catch(e) { res.writeHead(400); res.end('Bad JSON'); return; }
             
             var messages = data.messages || [];
-            var username = data.username;
+            var username = decoded.username;
             var enableTools = data.tools !== false;
             
             // Add tools info to system message if enabled
@@ -1278,9 +1413,10 @@ const server = http.createServer(async function(req, res) {
 
 initDB();
 server.listen(PORT, '0.0.0.0', function() {
-    console.log('\nAI-CICADA Web Chat v5.0 - With Tools, Memory & Web Search');
+    console.log('\nAI-CICADA Web Chat v5.1 - With JWT Auth, Tools, Memory & Web Search');
     console.log('Model  : ' + MODEL);
     console.log('DB     : ' + (db ? DB_PATH : 'in-memory (fallback)'));
+    console.log('Auth   : JWT enabled (' + (jwt ? 'jsonwebtoken' : 'fallback') + ')');
     console.log('Tools  : ' + Object.keys(TOOLS).join(', '));
     console.log('Open   : http://localhost:' + PORT);
     console.log('\nPress Ctrl+C to stop\n');
@@ -1453,7 +1589,7 @@ body::after{content:'';position:fixed;width:600px;height:600px;border-radius:50%
   <div class="card">
     <div class="card-logo">
       <div class="card-logo-icon">&#129432;</div>
-      <div><div class="card-logo-name">AI-CICADA</div><div class="card-logo-sub">SQLite</div></div>
+      <div><div class="card-logo-name">AI-CICADA</div><div class="card-logo-sub">SQLite + JWT</div></div>
     </div>
     <h2>Вход</h2>
     <p>Войдите в аккаунт для начала работы</p>
@@ -1472,7 +1608,7 @@ body::after{content:'';position:fixed;width:600px;height:600px;border-radius:50%
       <div><div class="card-logo-name">AI-CICADA</div><div class="card-logo-sub">Регистрация</div></div>
     </div>
     <h2>Регистрация</h2>
-    <p>Данные хранятся локально в SQLite</p>
+    <p>Данные хранятся локально в SQLite. Защищено JWT.</p>
     <div id="regError" class="error-msg"></div>
     <div class="field"><label>Логин</label><input id="regUser" type="text" placeholder="username"></div>
     <div class="field"><label>Пароль</label><input id="regPass" type="password" placeholder="минимум 4 символа"></div>
@@ -1487,7 +1623,7 @@ body::after{content:'';position:fixed;width:600px;height:600px;border-radius:50%
     <div class="sidebar" id="sidebar">
       <div class="sidebar-header">
         <div class="sidebar-logo-icon">&#129432;</div>
-        <div><div class="sidebar-logo-name">AI-CICADA</div><div class="sidebar-logo-sub">Локальный ИИ</div></div>
+        <div><div class="sidebar-logo-name">AI-CICADA</div><div class="sidebar-logo-sub">JWT Auth</div></div>
       </div>
       <button class="btn-new-chat" onclick="newChat()">+ Новый чат</button>
       <div class="sidebar-section-title">История</div>
@@ -1496,7 +1632,7 @@ body::after{content:'';position:fixed;width:600px;height:600px;border-radius:50%
         <div class="profile-avatar" id="sidebarAvatar">?</div>
         <div class="profile-info">
           <div class="profile-name" id="sidebarName">—</div>
-          <div class="profile-role">SQLite</div>
+          <div class="profile-role">JWT + SQLite</div>
         </div>
         <button class="btn-logout" onclick="showProfilePage()" title="Профиль">&#128100;</button>
         <button class="btn-logout" onclick="logout()" title="Выйти">&#x21E5;</button>
@@ -1527,8 +1663,8 @@ body::after{content:'';position:fixed;width:600px;height:600px;border-radius:50%
       <div class="profile-big-avatar" id="profileAvatar">?</div>
       <div>
         <div class="profile-big-name" id="profileName">—</div>
-        <div class="profile-big-sub" id="profileSub">Локальный аккаунт</div>
-        <div class="db-badge">&#128190; SQLite</div>
+        <div class="profile-big-sub" id="profileSub">JWT защита</div>
+        <div class="db-badge">&#128190; SQLite + JWT</div>
       </div>
     </div>
     <div class="stats-grid">
@@ -1540,7 +1676,7 @@ body::after{content:'';position:fixed;width:600px;height:600px;border-radius:50%
       <div class="info-row"><div class="info-row-icon">&#128100;</div><div class="info-row-content"><div class="info-row-label">Пользователь</div><div class="info-row-value" id="infoUser">—</div></div></div>
       <div class="info-row"><div class="info-row-icon">&#129302;</div><div class="info-row-content"><div class="info-row-label">Модель</div><div class="info-row-value" id="infoModel">—</div></div></div>
       <div class="info-row"><div class="info-row-icon">&#128197;</div><div class="info-row-content"><div class="info-row-label">Регистрация</div><div class="info-row-value" id="infoDate">—</div></div></div>
-      <div class="info-row"><div class="info-row-icon">&#128190;</div><div class="info-row-content"><div class="info-row-label">Хранилище</div><div class="info-row-value">SQLite · cicada.db</div></div></div>
+      <div class="info-row"><div class="info-row-icon">&#128190;</div><div class="info-row-content"><div class="info-row-label">Хранилище</div><div class="info-row-value">SQLite + JWT Auth</div></div></div>
     </div>
     <div class="info-section">
       <div class="info-row" style="cursor:pointer" onclick="clearAllHistory()"><div class="info-row-icon">&#128465;</div><div class="info-row-content"><div class="info-row-label">ДЕЙСТВИЕ</div><div class="info-row-value" style="color:var(--accent2)">Очистить историю чатов</div></div></div>
@@ -1558,25 +1694,38 @@ var chatHistory   = [];
 var generating    = false;
 
 var API = {
-    _post: function(url, data) {
-        return fetch(url, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(data) }).then(function(r){ return r.json(); });
+    _token: function() { return Session.getToken(); },
+    _headers: function() {
+        var h = { 'Content-Type': 'application/json' };
+        var t = API._token();
+        if (t) h['Authorization'] = 'Bearer ' + t;
+        return h;
     },
-    _get: function(url) { return fetch(url).then(function(r){ return r.json(); }); },
-    _del: function(url) { return fetch(url, { method:'DELETE' }).then(function(r){ return r.json(); }); },
+    _post: function(url, data) {
+        return fetch(url, { method:'POST', headers: API._headers(), body: JSON.stringify(data) }).then(function(r){ return r.json(); });
+    },
+    _get: function(url) {
+        return fetch(url, { headers: { 'Authorization': 'Bearer ' + (API._token() || '') } }).then(function(r){ return r.json(); });
+    },
+    _del: function(url) {
+        return fetch(url, { method:'DELETE', headers: { 'Authorization': 'Bearer ' + (API._token() || '') } }).then(function(r){ return r.json(); });
+    },
     register: function(u,p)    { return API._post('/api/register', { username:u, password:p }); },
     login:    function(u,p)    { return API._post('/api/login',    { username:u, password:p }); },
-    stats:    function(u)      { return API._get('/api/stats?user=' + encodeURIComponent(u)); },
-    getChats: function(u)      { return API._get('/api/chats?user=' + encodeURIComponent(u)); },
-    upsertChat: function(id,u,t){ return API._post('/api/chats', { chatId:id, username:u, title:t }); },
+    stats:    function()      { return API._get('/api/stats'); },
+    getChats: function()      { return API._get('/api/chats'); },
+    upsertChat: function(id,t){ return API._post('/api/chats', { chatId:id, title:t }); },
     deleteChat: function(id)   { return API._del('/api/chats/' + encodeURIComponent(id)); },
     getMsgs:  function(id)     { return API._get('/api/messages/' + encodeURIComponent(id)); },
-    addMsg:   function(id,r,c,u){ return API._post('/api/messages', { chatId:id, role:r, content:c, username:u }); }
+    addMsg:   function(id,r,c){ return API._post('/api/messages', { chatId:id, role:r, content:c }); }
 };
 
 var Session = {
     get:   function() { return sessionStorage.getItem('ac_user'); },
     set:   function(u){ sessionStorage.setItem('ac_user', u); },
-    clear: function() { sessionStorage.removeItem('ac_user'); }
+    clear: function() { sessionStorage.removeItem('ac_user'); sessionStorage.removeItem('ac_token'); },
+    getToken: function() { return sessionStorage.getItem('ac_token'); },
+    setToken: function(t){ sessionStorage.setItem('ac_token', t); }
 };
 
 function showPage(id) {
@@ -1596,8 +1745,10 @@ function login() {
     if (!u || !p) return showError('loginError', 'Заполните все поля');
     API.login(u, p).then(function(res) {
         if (res.error) return showError('loginError', res.error);
+        if (!res.token) return showError('loginError', 'Auth error: no token');
         currentUser = res;
         Session.set(u);
+        Session.setToken(res.token);
         enterChat();
     });
 }
@@ -1612,7 +1763,8 @@ function register() {
         if (res.error) return showError('regError', res.error);
         API.login(u, p).then(function(r2) {
             if (r2.error) return showPage('loginPage');
-            currentUser = r2; Session.set(u); enterChat();
+            if (!r2.token) return showError('regError', 'Auth error: no token');
+            currentUser = r2; Session.set(u); Session.setToken(r2.token); enterChat();
         });
     });
 }
@@ -1732,12 +1884,12 @@ function send() {
         document.getElementById('chatTitle').textContent = text.slice(0, 30) + (text.length > 30 ? '...' : '');
         saveCurrentChat(text);
     }
-    if (currentUser) API.addMsg(currentChatId, 'user', text, currentUser.username);
+    if (currentUser) API.addMsg(currentChatId, 'user', text);
     document.getElementById('statusDot').className = 'status-indicator loading';
     var typingEl = addTyping();
     var fullText = '';
     var aiBubble = null;
-    fetch('/chat', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ messages: chatHistory }) })
+    fetch('/chat', { method:'POST', headers: API._headers(), body: JSON.stringify({ messages: chatHistory }) })
     .then(function(res) {
         var reader = res.body.getReader();
         var dec = new TextDecoder();
@@ -1887,16 +2039,19 @@ document.getElementById('input').addEventListener('keydown', function(e) {
 
 (function init() {
     var username = Session.get();
-    if (username) {
-        API.stats(username).then(function(stats) {
+    var token = Session.getToken();
+    if (username && token) {
+        API.stats().then(function(stats) {
             if (!stats.error) {
                 currentUser = Object.assign({ username: username }, stats);
                 enterChat();
             } else {
+                Session.clear();
                 showPage('loginPage');
             }
-        }).catch(function(){ showPage('loginPage'); });
+        }).catch(function(){ Session.clear(); showPage('loginPage'); });
     } else {
+        Session.clear();
         showPage('loginPage');
     }
 })();

@@ -157,8 +157,6 @@ spinner() {
         local temp=${spin#?}
         printf "\r${BLUE}[%c] Processing...${NC}" "$spin"
         spin=$temp${spin%"$temp"}
-        # Use bash built-in read -t instead of sleep to avoid
-        # "libpcre2-8.so not found" errors on broken Termux installs
         read -r -t 0.1 _ 2>/dev/null </dev/null || true
     done
     printf "\r%-30s\r" " "
@@ -288,12 +286,10 @@ select_model() {
 
 fix_termux_libs() {
     [ "$ENV_TYPE" != "termux" ] && return
-    # Test if external binaries link correctly (libpcre2-8.so issue)
     if ! (sleep 0 >/dev/null 2>&1); then
         printf "${YELLOW}⚠  Termux: broken libpcre2, fixing...${NC}\n"
-        # pkg itself may work even when sleep doesn't
         pkg install -y pcre2 2>&1 | tail -3 || true
-        printf "${GREEN}✓ pcre2 installed, continuing...${NC}\n"
+        printf "${GREEN}✓ pcre2 fixed${NC}\n"
     fi
 }
 
@@ -395,20 +391,12 @@ install_python() {
     if [ "$ENV_TYPE" != "termux" ]; then return; fi
     printf "${BLUE}Checking Python3 (Termux)...${NC}\n"
     if command -v python3 >/dev/null 2>&1; then
-        printf "${GREEN}Python3 already installed (%s)${NC}\n" "$(python3 --version 2>&1)"
-        return
+        printf "${GREEN}Python3 already installed (%s)${NC}\n" "$(python3 --version 2>&1)"; return
     fi
-    printf "${BLUE}Installing Python3...${NC}\n"
     timer_start
-    (yes N | pkg install -y python >> "$LOG_FILE" 2>&1) &
-    spinner $!
+    (yes N | pkg install -y python >> "$LOG_FILE" 2>&1) & spinner $!
     timer_end
-    if command -v python3 >/dev/null 2>&1; then
-        printf "${GREEN}Python3 installed: %s${NC}\n" "$(python3 --version 2>&1)"
-    else
-        printf "${RED}Python3 installation failed. Check %s${NC}\n" "$LOG_FILE"
-        exit 1
-    fi
+    command -v python3 >/dev/null 2>&1 && printf "${GREEN}Python3 ready${NC}\n" || { printf "${RED}Python3 failed${NC}\n"; exit 1; }
 }
 
 install_ollama() {
@@ -452,9 +440,9 @@ install_ollama() {
             spinner $!
             ;;
         wsl)
-            printf "${YELLOW}WSL detected: using standard Ollama installer...${NC}\n"
+            printf "${YELLOW}WSL: installing Ollama...${NC}\n"
             if ! command -v zstd >/dev/null 2>&1; then
-                printf "${BLUE}Installing zstd (required for Ollama extraction)...${NC}\n"
+                printf "${BLUE}Installing zstd...${NC}\n"
                 sudo DEBIAN_FRONTEND=noninteractive apt install -y zstd >> "$LOG_FILE" 2>&1
             fi
             curl -fsSL https://ollama.com/install.sh | sh >> "$LOG_FILE" 2>&1 &
@@ -482,27 +470,25 @@ start_ollama_service() {
     fi
     case $ENV_TYPE in
         termux)
-            nohup ollama serve >> "$LOG_FILE" 2>&1 &
-            disown
+            OLLAMA_ORIGINS='*' ollama serve >> "$LOG_FILE" 2>&1 &
             ;;
         homeassistant|wsl-ha)
-            ollama serve >> "$LOG_FILE" 2>&1 &
-            printf "${YELLOW}Ollama running in background. After reboot run: ollama serve &${NC}\n"
+            OLLAMA_ORIGINS='*' ollama serve >> "$LOG_FILE" 2>&1 &
+            printf "${YELLOW}Ollama running in background. After reboot run: OLLAMA_ORIGINS='*' ollama serve &${NC}\n"
             ;;
         wsl)
-            # WSL may not have systemd, try to use it if available, otherwise background
             if command -v systemctl >/dev/null 2>&1 && systemctl is-system-running >/dev/null 2>&1; then
-                sudo systemctl enable --now ollama >> "$LOG_FILE" 2>&1 || ollama serve >> "$LOG_FILE" 2>&1 &
+                sudo systemctl enable --now ollama >> "$LOG_FILE" 2>&1 || OLLAMA_ORIGINS='*' ollama serve >> "$LOG_FILE" 2>&1 &
             else
                 printf "${YELLOW}WSL: Starting Ollama in background (no systemd)${NC}\n"
-                ollama serve >> "$LOG_FILE" 2>&1 &
+                OLLAMA_ORIGINS='*' ollama serve >> "$LOG_FILE" 2>&1 &
             fi
             ;;
         *)
             if command -v systemctl >/dev/null 2>&1; then
-                sudo systemctl enable --now ollama >> "$LOG_FILE" 2>&1 || ollama serve >> "$LOG_FILE" 2>&1 &
+                sudo systemctl enable --now ollama >> "$LOG_FILE" 2>&1 || OLLAMA_ORIGINS='*' ollama serve >> "$LOG_FILE" 2>&1 &
             else
-                ollama serve >> "$LOG_FILE" 2>&1 &
+                OLLAMA_ORIGINS='*' ollama serve >> "$LOG_FILE" 2>&1 &
             fi
             ;;
     esac
@@ -575,6 +561,7 @@ const https  = require('https');
 
 const PORT       = 3000;
 const MODEL      = process.env.AI_MODEL || 'qwen2.5-coder:3b';
+const OLLAMA_URL = process.env.OLLAMA_HOST || 'http://localhost:11434';
 const DB_PATH    = path.join(__dirname, 'cicada.db');
 let axios = null;
 try { axios = require('axios'); } catch(e) { console.log('axios not available, web search disabled'); }
@@ -981,7 +968,7 @@ const server = http.createServer(async function(req, res) {
     }
 
     if (req.method === 'GET' && url === '/model') {
-        return jsonOk(res, { model: MODEL, tools: Object.keys(TOOLS), web_search: !!axios });
+        return jsonOk(res, { model: MODEL, ollama_url: OLLAMA_URL, tools: Object.keys(TOOLS), web_search: !!axios });
     }
 
     /* Auth */
@@ -1133,8 +1120,11 @@ const server = http.createServer(async function(req, res) {
             }
 
             var payload = JSON.stringify({ model: MODEL, messages: messages, stream: true });
+            var ollamaHost = OLLAMA_URL.replace(/^https?:\/\//, '').split(':');
+            var ollamaHostname = ollamaHost[0];
+            var ollamaPort = parseInt(ollamaHost[1]) || 11434;
             var options = {
-                hostname: 'localhost', port: 11434, path: '/api/chat', method: 'POST',
+                hostname: ollamaHostname, port: ollamaPort, path: '/api/chat', method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) }
             };
 
@@ -1179,6 +1169,8 @@ server.listen(PORT, '0.0.0.0', function() {
     console.log('Open   : http://localhost:' + PORT);
     console.log('\nPress Ctrl+C to stop\n');
 });
+process.on('uncaughtException', function(err) { console.error('[uncaughtException]', err.message); });
+process.on('unhandledRejection', function(r) { console.error('[unhandledRejection]', r); });
 """
 
 with open(path, 'w') as f:
@@ -1309,7 +1301,7 @@ body::after{content:'';position:fixed;width:600px;height:600px;border-radius:50%
 #messages::-webkit-scrollbar{width:4px}
 #messages::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
 .welcome{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:40px 20px;gap:14px}
-.welcome-cicada{font-size:56px;font-family:"Noto Color Emoji","Apple Color Emoji","Segoe UI Emoji","Segoe UI Symbol",sans-serif;filter:drop-shadow(0 0 20px rgba(200,255,0,0.4));animation:float 3s ease-in-out infinite}
+.welcome-cicada{font-size:56px;filter:drop-shadow(0 0 20px rgba(200,255,0,0.4));animation:float 3s ease-in-out infinite}
 @keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-8px)}}
 .welcome h1{font-family:var(--font-head);font-size:22px;font-weight:900;background:linear-gradient(135deg,var(--accent),var(--accent2));-webkit-background-clip:text;-webkit-text-fill-color:transparent;letter-spacing:2px}
 .welcome p{color:var(--text2);font-size:13px;line-height:1.7;max-width:300px}
@@ -1321,8 +1313,7 @@ body::after{content:'';position:fixed;width:600px;height:600px;border-radius:50%
 .msg.user{flex-direction:row-reverse}
 .avatar{width:30px;height:30px;border-radius:9px;flex-shrink:0;margin-top:2px;display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:700;font-family:var(--font-head)}
 .msg.user .avatar{background:linear-gradient(135deg,var(--accent3),var(--accent));color:#000;font-size:12px}
-.msg.ai .avatar{background:linear-gradient(135deg,#0a1a3a,#0a1a2a);border:1px solid rgba(0,229,255,0.3);font-size:15px;font-family:"Noto Color Emoji","Apple Color Emoji","Segoe UI Emoji","Segoe UI Symbol",sans-serif;font-weight:400}
-.typing-wrap .avatar{font-family:"Noto Color Emoji","Apple Color Emoji","Segoe UI Emoji","Segoe UI Symbol",sans-serif;font-weight:400}
+.msg.ai .avatar{background:linear-gradient(135deg,#0a1a3a,#0a1a2a);border:1px solid rgba(0,229,255,0.3);font-size:15px}
 .bubble{max-width:min(80%,520px);padding:11px 15px;border-radius:var(--r);line-height:1.65;word-break:break-word;font-size:13.5px}
 .msg.user .bubble{background:var(--user-bg);border:1px solid rgba(200,255,0,0.15);border-bottom-right-radius:4px;color:#d8ffaa}
 .msg.ai .bubble{background:var(--ai-bg);border:1px solid rgba(0,229,255,0.1);border-bottom-left-radius:4px}
@@ -1384,7 +1375,7 @@ body::after{content:'';position:fixed;width:600px;height:600px;border-radius:50%
 
 <div class="search-overlay" id="searchOverlay" onclick="closeSearch(event)">
   <div class="search-modal" onclick="event.stopPropagation()">
-    <h3>🔍 Web Search</h3>
+    <h3>&#128270; Web Search</h3>
     <div class="search-input-wrap">
       <input type="text" class="search-input" id="searchInput" placeholder="Введите поисковый запрос..." onkeydown="if(event.key==='Enter')doSearch()">
       <button class="search-btn" onclick="doSearch()">Поиск</button>
@@ -1395,7 +1386,7 @@ body::after{content:'';position:fixed;width:600px;height:600px;border-radius:50%
 
 <div class="search-overlay" id="memoryOverlay" onclick="closeMemory(event)">
   <div class="memory-modal" onclick="event.stopPropagation()">
-    <h3>🧠 Memory / Память</h3>
+    <h3>&#129504; Memory / Память</h3>
     <div id="memoryList" style="margin-bottom:16px"></div>
     <div class="memory-form">
       <input type="text" id="memKey" placeholder="Ключ (например: любимый_цвет)">
@@ -1409,14 +1400,14 @@ body::after{content:'';position:fixed;width:600px;height:600px;border-radius:50%
 <div class="page" id="loginPage">
   <div class="card">
     <div class="card-logo">
-      <div class="card-logo-icon">🐸</div>
+      <div class="card-logo-icon">&#129432;</div>
       <div><div class="card-logo-name">AI-CICADA</div><div class="card-logo-sub">v5.0 +Tools +Memory +Search</div></div>
     </div>
     <h2>Вход</h2>
     <p>Войдите в аккаунт для начала работы</p>
     <div id="loginError" class="error-msg"></div>
     <div class="field"><label>Логин</label><input id="loginUser" type="text" placeholder="username"></div>
-    <div class="field"><label>Пароль</label><input id="loginPass" type="password" placeholder="••••••"></div>
+    <div class="field"><label>Пароль</label><input id="loginPass" type="password" placeholder="&#9679;&#9679;&#9679;&#9679;&#9679;&#9679;"></div>
     <button class="btn btn-primary" onclick="login()">Войти</button>
     <button class="btn btn-ghost" onclick="showPage('registerPage')">Нет аккаунта? Зарегистрироваться</button>
   </div>
@@ -1425,7 +1416,7 @@ body::after{content:'';position:fixed;width:600px;height:600px;border-radius:50%
 <div class="page hidden" id="registerPage">
   <div class="card">
     <div class="card-logo">
-      <div class="card-logo-icon">🐸</div>
+      <div class="card-logo-icon">&#129432;</div>
       <div><div class="card-logo-name">AI-CICADA</div><div class="card-logo-sub">Регистрация</div></div>
     </div>
     <h2>Регистрация</h2>
@@ -1444,7 +1435,7 @@ body::after{content:'';position:fixed;width:600px;height:600px;border-radius:50%
   <div class="app-layout">
     <div class="sidebar" id="sidebar">
       <div class="sidebar-header">
-        <div class="sidebar-logo-icon">🐸</div>
+        <div class="sidebar-logo-icon">&#129432;</div>
         <div><div class="sidebar-logo-name">AI-CICADA</div><div class="sidebar-logo-sub">v5.0</div></div>
       </div>
       <button class="btn-new-chat" onclick="newChat()">+ Новый чат</button>
@@ -1539,7 +1530,7 @@ var currentChatId = null;
 var chatHistory   = [];
 var generating    = false;
 var availableTools = [];
-var toolsEnabled  = true;
+var toolsEnabled  = false;
 
 var API = {
     _post: function(url, data) {
@@ -1666,7 +1657,7 @@ function newChat() {
 function resetMessages() {
     var m = document.getElementById('messages');
     m.innerHTML = '<div class="welcome" id="welcomeBlock">' +
-        '<div class="welcome-cicada">🐸</div>' +
+        '<div class="welcome-cicada">&#129432;</div>' +
         '<h1>AI-CICADA v5</h1>' +
         '<p>Локальный ИИ с памятью, поиском и инструментами</p>' +
         '<div class="welcome-chips">' +
@@ -1863,7 +1854,10 @@ function send() {
     var aiBubble = null;
     var toolCalls = [];
     
-    fetch('/chat', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ 
+    var abortCtrl = new AbortController();
+    var abortTimer = setTimeout(function() { abortCtrl.abort(); }, 120000); // 2 min timeout
+
+    fetch('/chat', { method:'POST', headers:{'Content-Type':'application/json'}, signal: abortCtrl.signal, body: JSON.stringify({ 
         messages: chatHistory, 
         username: currentUser ? currentUser.username : null,
         tools: toolsEnabled 
@@ -1883,15 +1877,15 @@ function send() {
                         if (json.error) throw new Error(json.error);
                         if (json.text) {
                             fullText += json.text;
-                            // Check for tool call in JSON format
-                            if (fullText.includes('"tool":')) {
+                            var trimmed = fullText.trim();
+                            if (trimmed.startsWith('{') && trimmed.includes('"tool":')) {
                                 try {
-                                    var toolCall = JSON.parse(fullText);
+                                    var toolCall = JSON.parse(trimmed);
                                     if (toolCall.tool && toolCall.arguments) {
                                         toolCalls.push(toolCall);
                                         fullText = '';
                                         if (aiBubble) {
-                                            aiBubble.querySelector('.bubble').innerHTML = '<div style="color:var(--accent2)">&#129522; Выполняю: ' + toolCall.tool + '...</div>';
+                                            aiBubble.querySelector('.bubble').innerHTML = '<div style="color:var(--accent2)">&#129518; Выполняю: ' + toolCall.tool + '...</div>';
                                         }
                                     }
                                 } catch(e) {}
@@ -1900,7 +1894,11 @@ function send() {
                             var bubble = aiBubble.querySelector('.bubble');
                             if (!toolCalls.length) {
                                 bubble.innerHTML = '';
-                                bubble.appendChild(renderMd(fullText));
+                                if (fullText.trim().startsWith('{')) {
+                                    bubble.innerHTML = '<div style="color:var(--accent2)">&#129518; Обрабатываю...</div>';
+                                } else {
+                                    bubble.appendChild(renderMd(fullText));
+                                }
                             }
                             document.getElementById('messages').scrollTop = 999999;
                         }
@@ -1971,9 +1969,16 @@ function send() {
     })
     .catch(function(err) { 
         if (!aiBubble) typingEl.remove(); 
-        if (err.message) addMsg('ai', 'Ошибка: ' + err.message); 
+        if (err.message && err.message !== 'AbortError') addMsg('ai', 'Ошибка: ' + err.message); 
     })
     .finally(function() {
+        clearTimeout(abortTimer);
+        // If bubble is stuck on "Обрабатываю..." (JSON that never became a tool call), show real text
+        if (aiBubble && !toolCalls.length && fullText) {
+            var bubble = aiBubble.querySelector('.bubble');
+            bubble.innerHTML = '';
+            bubble.appendChild(renderMd(fullText));
+        }
         if (fullText && currentUser && !toolCalls.length) {
             chatHistory.push({ role: 'assistant', content: fullText });
             API.addMsg(currentChatId, 'assistant', fullText, currentUser.username);
@@ -1992,7 +1997,7 @@ function addMsg(role, text) {
     div.className = 'msg ' + (role === 'user' ? 'user' : 'ai');
     var av = document.createElement('div');
     av.className = 'avatar';
-    av.textContent = role === 'user' ? (currentUser ? currentUser.username[0].toUpperCase() : 'Я') : (role === 'system' ? '🤖' : '🐸');
+    av.textContent = role === 'user' ? (currentUser ? currentUser.username[0].toUpperCase() : 'Я') : (role === 'system' ? '&#129522;' : '&#129432;');
     var bubble = document.createElement('div');
     bubble.className = 'bubble';
     if (text) bubble.appendChild(renderMd(text));
@@ -2005,7 +2010,7 @@ function addTyping() {
     var m = document.getElementById('messages');
     var div = document.createElement('div');
     div.className = 'typing-wrap';
-    div.innerHTML = '<div class="avatar">🐸</div><div class="typing-bubble"><span></span><span></span><span></span></div>';
+    div.innerHTML = '<div class="avatar">&#129432;</div><div class="typing-bubble"><span></span><span></span><span></span></div>';
     m.appendChild(div); m.scrollTop = 999999;
     return div;
 }
@@ -2118,6 +2123,108 @@ print("index.html written OK")
 PYEOF
 }
 
+create_chat_html() {
+    printf "${BLUE}Creating ollama-chat.html (no Node.js required)...${NC}\n"
+    mkdir -p "$CHAT_DIR"
+    cat > "$CHAT_DIR/ollama-chat.html" << 'HTMLEOF'
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Ollama Chat</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&display=swap');
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#080809;--bg2:#0f0f11;--bg3:#18181c;--bg4:#222228;--acc:#c8f135;--acc2:#3bffc0;--txt:#e8e8ec;--dim:#666672;--err:#ff4c6a;--font:'IBM Plex Mono',monospace}
+html,body{height:100%;background:var(--bg);color:var(--txt);font-family:var(--font);font-size:14px}
+#app{display:flex;flex-direction:column;height:100vh}
+#header{display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid var(--bg4);background:var(--bg2);flex-shrink:0}
+#header .logo{color:var(--acc);font-weight:500;font-size:13px;letter-spacing:.05em}
+#model-badge{margin-left:auto;background:var(--bg4);color:var(--acc2);padding:3px 9px;border-radius:20px;font-size:11px;cursor:pointer;border:1px solid transparent;transition:border-color .2s}
+#model-badge:hover{border-color:var(--acc2)}
+#status-dot{width:7px;height:7px;border-radius:50%;background:var(--dim);flex-shrink:0;transition:background .3s}
+#status-dot.ok{background:var(--acc)}
+#status-dot.err{background:var(--err)}
+#status-dot.busy{background:var(--acc2);animation:pulse 1s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+#settings{display:none;flex-direction:column;gap:10px;padding:14px;border-bottom:1px solid var(--bg4);background:var(--bg2)}
+#settings.open{display:flex}
+#settings label{font-size:11px;color:var(--dim);margin-bottom:3px;display:block}
+#settings input{width:100%;background:var(--bg3);color:var(--txt);border:1px solid var(--bg4);border-radius:6px;padding:7px 10px;font-family:var(--font);font-size:13px;outline:none}
+#settings input:focus{border-color:var(--acc2)}
+#settings .row{display:flex;gap:8px}
+#settings .row>div{flex:1}
+#btn-save{background:var(--acc);color:#000;border:none;padding:8px 16px;border-radius:6px;font-family:var(--font);font-size:12px;font-weight:500;cursor:pointer;align-self:flex-start}
+#btn-save:hover{opacity:.85}
+#messages{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:10px;scroll-behavior:smooth}
+#messages::-webkit-scrollbar{width:4px}
+#messages::-webkit-scrollbar-thumb{background:var(--bg4);border-radius:2px}
+.msg{display:flex;gap:10px;animation:fadeIn .15s ease}
+@keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+.msg.user{flex-direction:row-reverse}
+.msg.system-msg{justify-content:center}
+.bubble{max-width:82%;padding:10px 13px;border-radius:14px;line-height:1.55;white-space:pre-wrap;word-break:break-word;font-size:13px}
+.msg.user .bubble{background:var(--bg4);border-bottom-right-radius:4px}
+.msg.assistant .bubble{background:var(--bg2);border:1px solid var(--bg3);border-bottom-left-radius:4px}
+.msg.system-msg .bubble{background:transparent;color:var(--dim);font-size:11px;border:none;padding:0}
+.msg.error .bubble{color:var(--err);background:transparent;border:none;padding:0;font-size:12px}
+.avatar{width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:13px;flex-shrink:0;margin-top:2px}
+.msg.user .avatar{background:var(--bg4)}
+.msg.assistant .avatar{background:var(--bg2);border:1px solid var(--bg3)}
+.cursor::after{content:'▋';animation:blink .7s step-end infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
+#inputbar{display:flex;gap:8px;padding:10px 14px;border-top:1px solid var(--bg4);background:var(--bg2);flex-shrink:0}
+#input{flex:1;background:var(--bg3);color:var(--txt);border:1px solid var(--bg4);border-radius:10px;padding:9px 12px;font-family:var(--font);font-size:13px;outline:none;resize:none;max-height:120px;line-height:1.4;transition:border-color .2s}
+#input:focus{border-color:var(--acc2)}
+#input::placeholder{color:var(--dim)}
+#btn-send{width:40px;height:40px;border-radius:10px;background:var(--acc);color:#000;border:none;cursor:pointer;font-size:18px;flex-shrink:0;display:flex;align-items:center;justify-content:center;transition:opacity .15s,transform .1s;align-self:flex-end}
+#btn-send:active{transform:scale(.92)}
+#btn-send:disabled{background:var(--bg4);color:var(--dim);cursor:not-allowed;transform:none}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="header">
+    <span class="logo">◈ OLLAMA</span>
+    <div id="status-dot"></div>
+    <div id="model-badge" onclick="toggleSettings()">⚙ <span id="model-label">...</span></div>
+  </div>
+  <div id="settings">
+    <div class="row">
+      <div><label>Ollama URL</label><input id="s-url" value="http://localhost:11434"/></div>
+      <div><label>Модель</label><input id="s-model" placeholder="llama3:8b"/></div>
+    </div>
+    <button id="btn-save" onclick="saveSettings()">Применить</button>
+  </div>
+  <div id="messages"></div>
+  <div id="inputbar">
+    <textarea id="input" rows="1" placeholder="Напишите сообщение..."></textarea>
+    <button id="btn-send" onclick="send()">➤</button>
+  </div>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+let cfg={url:localStorage.getItem('ol_url')||'http://localhost:11434',model:localStorage.getItem('ol_model')||'qwen2.5-coder:3b'};
+let history=[],busy=false;
+function applyConfig(){$('s-url').value=cfg.url;$('s-model').value=cfg.model;$('model-label').textContent=cfg.model;}
+function saveSettings(){cfg.url=$('s-url').value.trim().replace(/\/$/,'');cfg.model=$('s-model').value.trim();localStorage.setItem('ol_url',cfg.url);localStorage.setItem('ol_model',cfg.model);applyConfig();toggleSettings();ping();}
+function toggleSettings(){$('settings').classList.toggle('open');}
+async function ping(){const dot=$('status-dot');try{const r=await fetch(cfg.url+'/api/tags',{signal:AbortSignal.timeout(4000)});dot.className=r.ok?'ok':'err';}catch{dot.className='err';}}
+function addMsg(role,text){const wrap=document.createElement('div');wrap.className='msg '+role;if(role!=='system-msg'){const av=document.createElement('div');av.className='avatar';av.textContent=role==='user'?'T':'🐸';wrap.appendChild(av);}const bub=document.createElement('div');bub.className='bubble';bub.textContent=text;wrap.appendChild(bub);$('messages').appendChild(wrap);wrap.scrollIntoView({block:'end'});return bub;}
+function sysMsg(text){addMsg('system-msg',text);}
+async function send(){if(busy)return;const txt=$('input').value.trim();if(!txt)return;$('input').value='';$('input').style.height='auto';addMsg('user',txt);history.push({role:'user',content:txt});busy=true;$('btn-send').disabled=true;$('status-dot').className='busy';const bub=addMsg('assistant','');bub.classList.add('cursor');try{const res=await fetch(cfg.url+'/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:cfg.model,messages:history,stream:true})});if(!res.ok)throw new Error('HTTP '+res.status);const reader=res.body.getReader();const dec=new TextDecoder();let full='';while(true){const{done,value}=await reader.read();if(done)break;const lines=dec.decode(value).split('\n').filter(Boolean);for(const line of lines){try{const j=JSON.parse(line);const chunk=j?.message?.content||'';if(chunk){full+=chunk;bub.textContent=full;bub.parentElement.scrollIntoView({block:'end'});}}catch{}}}bub.classList.remove('cursor');history.push({role:'assistant',content:full});}catch(e){bub.classList.remove('cursor');bub.parentElement.className='msg error';bub.textContent='✗ '+(e.message||'Ошибка соединения');history.pop();}busy=false;$('btn-send').disabled=false;$('status-dot').className='ok';$('input').focus();}
+$('input').addEventListener('input',function(){this.style.height='auto';this.style.height=Math.min(this.scrollHeight,120)+'px';});
+$('input').addEventListener('keydown',function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();}});
+applyConfig();ping();sysMsg('Ollama: '+cfg.url);
+</script>
+</body>
+</html>
+HTMLEOF
+    printf "${GREEN}ollama-chat.html created: %s/ollama-chat.html${NC}\n" "$CHAT_DIR"
+    log "ollama-chat.html created"
+}
+
 create_web_chat() {
     printf "${BLUE}Creating web chat files...${NC}\n"
     mkdir -p "$CHAT_DIR"
@@ -2144,76 +2251,36 @@ export AI_MODEL="$MODEL"
 export AI_CICADA_DIR="$CHAT_DIR"
 
 ai() {
-    # Проверяем запущен ли Ollama (порт 11434)
-    if ! curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
+    set +e
+    if ! pgrep -x "ollama" > /dev/null 2>&1; then
         printf "Starting Ollama...\n"
-        nohup ollama serve > /dev/null 2>&1 &
-        disown
-        # Ждем пока Ollama действительно запустится
-        for i in 1 2 3 4 5 6 7 8 9 10; do
-            sleep 1
-            if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
-                printf "Ollama ready\n"
-                break
-            fi
-            printf "."
-        done
-        if ! curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
-            printf "\n${RED}Failed to start Ollama${NC}\n"
-            return 1
-        fi
+        ollama serve > /dev/null 2>&1 &
+        sleep 3
     fi
-    CLAUDE_CODE_USE_OPENAI=1 OPENAI_BASE_URL=http://localhost:11434/v1 OPENAI_MODEL=\$AI_MODEL openclaude
+    ollama run \$AI_MODEL
+    set -e 2>/dev/null || true
 }
 
 web() {
-    # Проверяем запущен ли Ollama (порт 11434)
-    if ! curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
+    set +e
+    if ! pgrep -x "ollama" > /dev/null 2>&1; then
         printf "Starting Ollama...\n"
-        nohup ollama serve > /dev/null 2>&1 &
-        disown
-        # Ждем пока Ollama действительно запустится
-        for i in 1 2 3 4 5 6 7 8 9 10; do
-            sleep 1
-            if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
-                printf "Ollama ready\n"
-                break
-            fi
-            printf "."
-        done
-        if ! curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
-            printf "\n${RED}Failed to start Ollama${NC}\n"
-            return 1
-        fi
+        OLLAMA_ORIGINS='*' ollama serve > /dev/null 2>&1 &
+        sleep 3
     fi
-    # Закрываем старый сервер если висит
-    kill_server
-    kill_server
-    # Cross-platform IP detection (works on WSL, Termux, HA, Linux)
     CHAT_IP=\$(ip route get 1 2>/dev/null | awk '{for(i=1;i<=NF;i++)if(\$i=="src"){print \$(i+1);exit}}' || hostname -I 2>/dev/null | awk '{print \$1}' || echo "localhost")
-    printf "${GREEN}Web chat: http://\${CHAT_IP}:3000${NC}\n"
-    # Авто-открытие браузера в WSL
-    if [ -n "\$WSL_DISTRO_NAME" ] && command -v explorer.exe > /dev/null 2>&1; then
-        explorer.exe "http://\${CHAT_IP}:3000" 2>/dev/null || true
-    fi
-    AI_MODEL=\$AI_MODEL node \$AI_CICADA_DIR/server.js
+    printf "Model  : \${AI_MODEL}\n"
+    printf "Web    : http://\${CHAT_IP}:3000\n"
+    OLLAMA_ORIGINS='*' AI_MODEL=\$AI_MODEL node \$AI_CICADA_DIR/server.js || {
+        printf "Error: server crashed. Check logs.\n"
+    }
+    set -e 2>/dev/null || true
 }
 
 aidb() {
     printf "DB: \$AI_CICADA_DIR/cicada.db\n"
     if command -v sqlite3 >/dev/null 2>&1; then
         sqlite3 "\$AI_CICADA_DIR/cicada.db" "SELECT username, total_msgs, datetime(created_at,'unixepoch') as reg FROM users;"
-    fi
-}
-
-# Закрыть старый сервер на порту 3000
-kill_server() {
-    local pid
-    pid=\$(lsof -t -i:3000 2>/dev/null || ss -tlnp 2>/dev/null | grep 3000 | grep -oP 'pid=\K[0-9]+' || netstat -tlnp 2>/dev/null | grep 3000 | awk '{print \$NF}' | cut -d'/' -f1)
-    if [ -n "\$pid" ]; then
-        kill -9 \$pid 2>/dev/null || true
-        sleep 1
-        printf "Closed old server on port 3000\n"
     fi
 }
 # END AI-CICADA
@@ -2266,6 +2333,7 @@ final_screen() {
         "Features : +Tools +Memory +WebSearch" \
         "" \
         "  web   -- http://${CHAT_HOST}:3000" \
+        "  chat  -- $CHAT_DIR/ollama-chat.html" \
         "  ai    -- terminal agent" \
         "  aidb  -- view database" \
         "" \
@@ -2288,40 +2356,14 @@ launch_choice() {
     CHAT_HOST=$(ip route get 1 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="src"){print $(i+1);exit}}' || hostname -I 2>/dev/null | awk '{print $1}' || echo "localhost")
     case $ch in
         1)
-            # Автозапуск Ollama с проверкой
-            if ! curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
-                printf "${YELLOW}Starting Ollama...${NC}\n"
-                nohup ollama serve >> "$LOG_FILE" 2>&1 &
-                disown
-                for i in 1 2 3 4 5 6 7 8 9 10; do
-                    sleep 1
-                    if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then break; fi
-                done
-            fi
-            # Закрываем старый сервер если висит
-            local old_pid
-            old_pid=$(lsof -t -i:3000 2>/dev/null || ss -tlnp 2>/dev/null | grep 3000 | grep -oP 'pid=\K[0-9]+' || netstat -tlnp 2>/dev/null | grep 3000 | awk '{print $NF}' | cut -d'/' -f1)
-            [ -n "$old_pid" ] && kill -9 $old_pid 2>/dev/null && sleep 1
+            if ! pgrep -x "ollama" > /dev/null 2>&1; then OLLAMA_ORIGINS='*' ollama serve >> "$LOG_FILE" 2>&1 & sleep 3; fi
             printf "${GREEN}Open: http://%s:3000${NC}\n" "$CHAT_HOST"
             printf "${YELLOW}Press Ctrl+C to stop${NC}\n"
-            # Авто-открытие в WSL
-            if [ -n "$WSL_DISTRO_NAME" ] && command -v explorer.exe > /dev/null 2>&1; then
-                explorer.exe "http://${CHAT_HOST}:3000" 2>/dev/null || true
-            fi
             AI_MODEL="$MODEL" node "$CHAT_DIR/server.js"
             ;;
         2)
-            # Автозапуск Ollama с проверкой
-            if ! curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
-                printf "${YELLOW}Starting Ollama...${NC}\n"
-                nohup ollama serve >> "$LOG_FILE" 2>&1 &
-                disown
-                for i in 1 2 3 4 5 6 7 8 9 10; do
-                    sleep 1
-                    if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then break; fi
-                done
-            fi
-            CLAUDE_CODE_USE_OPENAI=1 OPENAI_BASE_URL=http://localhost:11434/v1 OPENAI_MODEL="$MODEL" openclaude
+            if ! pgrep -x "ollama" > /dev/null 2>&1; then OLLAMA_ORIGINS='*' ollama serve >> "$LOG_FILE" 2>&1 & sleep 3; fi
+            ollama run "$MODEL"
             ;;
         *) printf "${GREEN}Done! Run 'ai' or 'web' anytime.${NC}\n" ;;
     esac
@@ -2342,6 +2384,7 @@ main() {
     install_model; clear
     install_npm_deps; printf "\n"
     create_web_chat; printf "\n"
+    create_chat_html; printf "\n"
     setup_alias; printf "\n"
     show_ha_tips
     final_screen

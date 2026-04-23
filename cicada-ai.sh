@@ -13,6 +13,31 @@ BLUE='\033[0;34m'
 RED='\033[0;31m'
 NC='\033[0m'
 
+# Check if port is in use
+check_port() {
+    local port=$1
+    if command -v lsof >/dev/null 2>&1 && lsof -Pi :$port -sTCP:LISTEN -t >/dev/null 2>&1; then
+        return 0
+    elif command -v netstat >/dev/null 2>&1 && netstat -tuln 2>/dev/null | grep -q ":$port "; then
+        return 0
+    elif command -v ss >/dev/null 2>&1 && ss -tuln 2>/dev/null | grep -q ":$port "; then
+        return 0
+    elif [ -f /proc/net/tcp ] && awk '\$2 ~ /:'"$(printf '%04X' $port)"'/ {exit 0}' /proc/net/tcp 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+kill_port() {
+    local port=$1
+    local pids
+    pids=$(lsof -ti :$port 2>/dev/null || netstat -tulpn 2>/dev/null | grep ":$port " | awk '{print $7}' | cut -d'/' -f1 | grep -E '^[0-9]+$' || ss -tulpn 2>/dev/null | grep ":$port " | grep -oP 'pid=\K[0-9]+')
+    if [ -n "$pids" ]; then
+        echo "$pids" | xargs kill -9 2>/dev/null || true
+        sleep 1
+    fi
+}
+
 detect_wsl() {
     # Check for WSL using multiple methods
     if [ -f /proc/sys/kernel/osrelease ] && grep -qi "microsoft\|wsl" /proc/sys/kernel/osrelease 2>/dev/null; then
@@ -327,50 +352,63 @@ install_llama() {
     printf "${BLUE}Checking llama.cpp...${NC}\n"
     if command -v llama-server >/dev/null 2>&1 || command -v llama-cli >/dev/null 2>&1; then
         printf "${GREEN}llama.cpp already installed${NC}\n"
-        return
+        return 0
     fi
     printf "${BLUE}Installing llama.cpp...${NC}\n"
     timer_start
+    local exit_code=0
+    local install_pid
     case $ENV_TYPE in
         termux)
-            (yes N | pkg install -y llama-cpp 2>>"$LOG_FILE") &
-            spinner $!
+            (yes N | pkg install -y llama-cpp 2>>"$LOG_FILE") & install_pid=$!
+            spinner $install_pid
+            wait $install_pid || exit_code=$?
             ;;
         debian|wsl)
-            ($SUDO apt-get install -y llama-cpp >> "$LOG_FILE" 2>&1) &
-            spinner $!
+            ($SUDO apt-get install -y llama-cpp >> "$LOG_FILE" 2>&1) & install_pid=$!
+            spinner $install_pid
+            wait $install_pid || true
             if ! command -v llama-server >/dev/null 2>&1; then
                 printf "${YELLOW}llama-cpp not in repos, building from source...${NC}\n"
+                exit_code=0
                 ($SUDO apt-get install -y git cmake build-essential >> "$LOG_FILE" 2>&1 && \
                  git clone --depth 1 https://github.com/ggerganov/llama.cpp /tmp/llama.cpp >> "$LOG_FILE" 2>&1 && \
                  cd /tmp/llama.cpp && cmake -B build >> "$LOG_FILE" 2>&1 && \
                  cmake --build build -j"$(nproc)" --config Release >> "$LOG_FILE" 2>&1 && \
                  $SUDO cp build/bin/llama-server /usr/local/bin/ >> "$LOG_FILE" 2>&1 && \
-                 $SUDO cp build/bin/llama-cli /usr/local/bin/ >> "$LOG_FILE" 2>&1) &
-                spinner $!
+                 $SUDO cp build/bin/llama-cli /usr/local/bin/ >> "$LOG_FILE" 2>&1) & install_pid=$!
+                spinner $install_pid
+                wait $install_pid || exit_code=$?
             fi
             ;;
         fedora)
-            (sudo dnf install -y llama-cpp >> "$LOG_FILE" 2>&1) &
-            spinner $!
+            (sudo dnf install -y llama-cpp >> "$LOG_FILE" 2>&1) & install_pid=$!
+            spinner $install_pid
+            wait $install_pid || exit_code=$?
             ;;
         arch)
-            (sudo pacman -S --noconfirm llama-cpp >> "$LOG_FILE" 2>&1) &
-            spinner $!
+            (sudo pacman -S --noconfirm llama-cpp >> "$LOG_FILE" 2>&1) & install_pid=$!
+            spinner $install_pid
+            wait $install_pid || exit_code=$?
             ;;
         homeassistant|alpine|wsl-ha)
-            (apk add --no-cache llama-cpp >> "$LOG_FILE" 2>&1) &
-            spinner $!
+            (apk add --no-cache llama-cpp >> "$LOG_FILE" 2>&1) & install_pid=$!
+            spinner $install_pid
+            wait $install_pid || exit_code=$?
             ;;
         *)
             printf "${YELLOW}Please install llama.cpp manually: https://github.com/ggerganov/llama.cpp${NC}\n"
+            return 1
             ;;
     esac
     timer_end
     if command -v llama-server >/dev/null 2>&1; then
         printf "${GREEN}llama.cpp installed${NC}\n"
+        return 0
     else
         printf "${RED}llama.cpp installation failed. Check %s${NC}\n" "$LOG_FILE"
+        # Don't exit, llama.cpp is optional fallback
+        return 1
     fi
 }
 
@@ -400,10 +438,13 @@ PORT_WEB=3000
 
 launch_llamacpp() {
     printf "${BLUE}Starting llama-server on port %s...${NC}\n" "$PORT_LLAMA"
+    # Check and kill existing processes on ports
     pkill -f "llama-server" 2>/dev/null || true
     for P in $PORT_LLAMA $PORT_WEB; do
-        PID=$(lsof -ti tcp:"$P" 2>/dev/null || true)
-        [ -n "$PID" ] && kill -9 "$PID" 2>/dev/null || true
+        if check_port $P; then
+            printf "${YELLOW}Port %s busy, killing process...${NC}\n" "$P"
+            kill_port $P
+        fi
     done
     sleep 1
     LLAMA_LOG="$HOME/llama-server.log"
@@ -414,9 +455,15 @@ launch_llamacpp() {
     if ! kill -0 "$LLAMA_PID" 2>/dev/null; then
         printf "${RED}llama-server failed to start. Log:${NC}\n"
         cat "$LLAMA_LOG"
-        exit 1
+        return 1
     fi
     printf "${GREEN}llama-server running (PID %s)${NC}\n" "$LLAMA_PID"
+    # Check port 3000 before starting node
+    if check_port $PORT_WEB; then
+        printf "${YELLOW}Port %s still busy after cleanup, forcing kill...${NC}\n" "$PORT_WEB"
+        kill_port $PORT_WEB
+        sleep 1
+    fi
     local CHAT_HOST
     CHAT_HOST=$(ip route get 1 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="src"){print $(i+1);exit}}' || hostname -I 2>/dev/null | awk '{print $1}' || echo "localhost")
     printf "${GREEN}Open in browser: http://%s:%s${NC}\n" "$CHAT_HOST" "$PORT_WEB"
@@ -481,23 +528,32 @@ install_nodejs() {
     if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
         local ver; ver=$(node --version 2>/dev/null)
         printf "${GREEN}Node.js already installed (%s)${NC}\n" "$ver"
-        return
+        return 0
     fi
     printf "${BLUE}Installing Node.js...${NC}\n"
     timer_start
+    local exit_code=0
+    local install_pid
     case $ENV_TYPE in
-        termux)   (yes N | pkg install -y nodejs 2>>"$LOG_FILE") & spinner $! ;;
-        debian|wsl)   (sudo DEBIAN_FRONTEND=noninteractive apt install -y nodejs npm >> "$LOG_FILE" 2>&1) & spinner $! ;;
-        fedora)   (sudo dnf install -y nodejs npm >> "$LOG_FILE" 2>&1) & spinner $! ;;
-        arch)     (sudo pacman -S --noconfirm nodejs npm >> "$LOG_FILE" 2>&1) & spinner $! ;;
-        homeassistant|alpine|wsl-ha) (apk add --no-cache nodejs npm >> "$LOG_FILE" 2>&1) & spinner $! ;;
-        opensuse) (sudo zypper install -y nodejs npm >> "$LOG_FILE" 2>&1) & spinner $! ;;
-        void)     (sudo xbps-install -y nodejs >> "$LOG_FILE" 2>&1) & spinner $! ;;
-        *) printf "${YELLOW}Please install Node.js manually${NC}\n"; return ;;
+        termux)   (yes N | pkg install -y nodejs 2>>"$LOG_FILE") & install_pid=$! ;;
+        debian|wsl)   (sudo DEBIAN_FRONTEND=noninteractive apt install -y nodejs npm >> "$LOG_FILE" 2>&1) & install_pid=$! ;;
+        fedora)   (sudo dnf install -y nodejs npm >> "$LOG_FILE" 2>&1) & install_pid=$! ;;
+        arch)     (sudo pacman -S --noconfirm nodejs npm >> "$LOG_FILE" 2>&1) & install_pid=$! ;;
+        homeassistant|alpine|wsl-ha) (apk add --no-cache nodejs npm >> "$LOG_FILE" 2>&1) & install_pid=$! ;;
+        opensuse) (sudo zypper install -y nodejs npm >> "$LOG_FILE" 2>&1) & install_pid=$! ;;
+        void)     (sudo xbps-install -y nodejs >> "$LOG_FILE" 2>&1) & install_pid=$! ;;
+        *) printf "${YELLOW}Please install Node.js manually${NC}\n"; return 1 ;;
     esac
+    spinner $install_pid
+    wait $install_pid || exit_code=$?
     timer_end
-    if command -v node >/dev/null 2>&1; then
+    if [ $exit_code -ne 0 ]; then
+        printf "${RED}Node.js installation failed (exit code: %d). Check %s${NC}\n" "$exit_code" "$LOG_FILE"
+        exit 1
+    fi
+    if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
         printf "${GREEN}Node.js installed: %s${NC}\n" "$(node --version)"
+        return 0
     else
         printf "${RED}Node.js installation failed. Check %s${NC}\n" "$LOG_FILE"
         exit 1
@@ -508,8 +564,9 @@ install_sqlite_tools() {
     printf "${BLUE}Checking SQLite tools...${NC}\n"
     if command -v sqlite3 >/dev/null 2>&1; then
         printf "${GREEN}sqlite3 already available${NC}\n"
-        return
+        return 0
     fi
+    local exit_code=0
     case $ENV_TYPE in
         termux)   (yes N | pkg install -y sqlite 2>>"$LOG_FILE") & spinner $! ;;
         debian|wsl)   (sudo apt install -y sqlite3 >> "$LOG_FILE" 2>&1) & spinner $! ;;
@@ -519,28 +576,61 @@ install_sqlite_tools() {
         opensuse) (sudo zypper install -y sqlite3 >> "$LOG_FILE" 2>&1) & spinner $! ;;
         void)     (sudo xbps-install -y sqlite >> "$LOG_FILE" 2>&1) & spinner $! ;;
     esac
-    printf "${GREEN}SQLite tools ready${NC}\n"
+    wait $! || exit_code=$?
+    if [ $exit_code -ne 0 ]; then
+        printf "${YELLOW}SQLite install may have failed, continuing...${NC}\n"
+    fi
+    # Verify installation
+    if command -v sqlite3 >/dev/null 2>&1; then
+        printf "${GREEN}SQLite tools ready${NC}\n"
+        return 0
+    else
+        printf "${YELLOW}sqlite3 not available, DB features may be limited${NC}\n"
+        return 1
+    fi
 }
 
 install_ollama() {
     printf "${BLUE}Checking Ollama...${NC}\n"
     if command -v ollama >/dev/null 2>&1; then
         printf "${GREEN}Ollama already installed${NC}\n"
-        return
+        return 0
     fi
     printf "${BLUE}Installing Ollama...${NC}\n"
     timer_start
+    local exit_code=0
+    local install_pid
     case $ENV_TYPE in
         termux)
             if pkg show ollama >/dev/null 2>&1; then
-                (yes N | pkg install -y ollama >> "$LOG_FILE" 2>&1) &
-                spinner $!
+                (yes N | pkg install -y ollama >> "$LOG_FILE" 2>&1) & install_pid=$!
+                spinner $install_pid
+                wait $install_pid || exit_code=$?
             else
                 printf "${YELLOW}Ollama not in pkg repos, using proot-distro...${NC}\n"
-                (yes N | pkg install -y proot-distro >> "$LOG_FILE" 2>&1)
-                proot-distro install ubuntu >> "$LOG_FILE" 2>&1
-                proot-distro login ubuntu -- bash -c "curl -fsSL https://ollama.com/install.sh | sh" >> "$LOG_FILE" 2>&1 &
-                spinner $!
+                if ! (yes N | pkg install -y proot-distro >> "$LOG_FILE" 2>&1); then
+                    printf "${RED}Failed to install proot-distro${NC}\n"
+                    return 1
+                fi
+                if ! proot-distro install ubuntu >> "$LOG_FILE" 2>&1; then
+                    printf "${YELLOW}proot-distro install may have failed, continuing...${NC}\n"
+                fi
+                # Safe download and execute
+                local INSTALLER="/data/data/com.termux/files/usr/tmp/ollama_install_$$.sh"
+                if ! curl -fsSL https://ollama.com/install.sh -o "$INSTALLER" >> "$LOG_FILE" 2>&1; then
+                    printf "${RED}Failed to download Ollama installer${NC}\n"
+                    return 1
+                fi
+                if [ -f "$INSTALLER" ] && [ -s "$INSTALLER" ]; then
+                    chmod +x "$INSTALLER"
+                    proot-distro login ubuntu -- "$INSTALLER" >> "$LOG_FILE" 2>&1 & install_pid=$!
+                    spinner $install_pid
+                    wait $install_pid || exit_code=$?
+                    rm -f "$INSTALLER"
+                else
+                    printf "${RED}Failed to download Ollama installer${NC}\n"
+                    return 1
+                fi
                 printf '#!/bin/sh\nproot-distro login ubuntu -- ollama "$@"\n' > "$PREFIX/bin/ollama"
                 chmod +x "$PREFIX/bin/ollama"
             fi
@@ -554,30 +644,58 @@ install_ollama() {
                 armv7l)  OLLAMA_BIN="ollama-linux-arm" ;;
                 *)
                     printf "${RED}Unsupported arch: %s${NC}\n" "$ARCH"
-                    exit 1
+                    return 1
                     ;;
             esac
             (curl -fsSL "https://github.com/ollama/ollama/releases/latest/download/${OLLAMA_BIN}" \
                 -o /usr/local/bin/ollama >> "$LOG_FILE" 2>&1 && \
-             chmod +x /usr/local/bin/ollama) &
-            spinner $!
+             chmod +x /usr/local/bin/ollama) & install_pid=$!
+            spinner $install_pid
+            wait $install_pid || exit_code=$?
             ;;
         wsl)
             printf "${YELLOW}WSL detected: using standard Ollama installer...${NC}\n"
-            curl -fsSL https://ollama.com/install.sh | sh >> "$LOG_FILE" 2>&1 &
-            spinner $!
+            local INSTALLER="/tmp/ollama_install_$$.sh"
+            if ! curl -fsSL https://ollama.com/install.sh -o "$INSTALLER" >> "$LOG_FILE" 2>&1; then
+                printf "${RED}Failed to download Ollama installer${NC}\n"
+                return 1
+            fi
+            if [ -f "$INSTALLER" ] && [ -s "$INSTALLER" ]; then
+                chmod +x "$INSTALLER"
+                "$INSTALLER" >> "$LOG_FILE" 2>&1 & install_pid=$!
+                spinner $install_pid
+                wait $install_pid || exit_code=$?
+                rm -f "$INSTALLER"
+            else
+                printf "${RED}Failed to download Ollama installer${NC}\n"
+                return 1
+            fi
             ;;
         *)
-            curl -fsSL https://ollama.com/install.sh | sh >> "$LOG_FILE" 2>&1 &
-            spinner $!
+            local INSTALLER="/tmp/ollama_install_$$.sh"
+            if ! curl -fsSL https://ollama.com/install.sh -o "$INSTALLER" >> "$LOG_FILE" 2>&1; then
+                printf "${RED}Failed to download Ollama installer${NC}\n"
+                return 1
+            fi
+            if [ -f "$INSTALLER" ] && [ -s "$INSTALLER" ]; then
+                chmod +x "$INSTALLER"
+                "$INSTALLER" >> "$LOG_FILE" 2>&1 & install_pid=$!
+                spinner $install_pid
+                wait $install_pid || exit_code=$?
+                rm -f "$INSTALLER"
+            else
+                printf "${RED}Failed to download Ollama installer${NC}\n"
+                return 1
+            fi
             ;;
     esac
     timer_end
     if command -v ollama >/dev/null 2>&1; then
         printf "${GREEN}Ollama installed${NC}\n"
+        return 0
     else
         printf "${RED}Ollama installation failed. Check %s${NC}\n" "$LOG_FILE"
-        exit 1
+        return 1
     fi
 }
 
@@ -638,9 +756,14 @@ install_model() {
 }
 
 install_npm_deps() {
-    printf "${BLUE}Installing npm dependencies (better-sqlite3)...${NC}\n"
+    printf "${BLUE}Installing npm dependencies...${NC}\n"
     mkdir -p "$CHAT_DIR"
     cd "$CHAT_DIR"
+    # Backup existing node_modules on re-run (idempotency)
+    if [ -d "$CHAT_DIR/node_modules" ] && [ ! -d "$CHAT_DIR/node_modules.backup" ]; then
+        printf "${YELLOW}Existing node_modules found, backing up...${NC}\n"
+        mv "$CHAT_DIR/node_modules" "$CHAT_DIR/node_modules.backup.$(date +%s)" 2>/dev/null || true
+    fi
     cat > package.json << 'PKGEOF'
 {
   "name": "ai-cicada",
@@ -653,15 +776,35 @@ install_npm_deps() {
   }
 }
 PKGEOF
-    (npm install >> "$LOG_FILE" 2>&1) &
-    spinner $!
-    if [ -d "$CHAT_DIR/node_modules/better-sqlite3" ]; then
+    # Run npm install with error capture
+    if ! (npm install >> "$LOG_FILE" 2>&1); then
+        printf "${RED}npm install failed! Check %s${NC}\n" "$LOG_FILE"
+        # Restore backup if exists
+        for backup in "$CHAT_DIR/node_modules.backup."*; do
+            if [ -d "$backup" ]; then
+                printf "${YELLOW}Restoring backup node_modules...${NC}\n"
+                rm -rf "$CHAT_DIR/node_modules" 2>/dev/null || true
+                mv "$backup" "$CHAT_DIR/node_modules"
+                break
+            fi
+        done
+        cd - > /dev/null
+        return 1
+    fi
+    # Verify critical dependencies
+    if [ ! -d "$CHAT_DIR/node_modules/better-sqlite3" ]; then
+        printf "${YELLOW}better-sqlite3 not installed, using in-memory fallback${NC}\n"
+        DB_FALLBACK=1
+    else
         printf "${GREEN}Dependencies installed${NC}\n"
         DB_FALLBACK=0
-    else
-        printf "${YELLOW}better-sqlite3 failed, using in-memory fallback${NC}\n"
-        DB_FALLBACK=1
     fi
+    # Verify JWT support
+    if [ ! -d "$CHAT_DIR/node_modules/jsonwebtoken" ]; then
+        printf "${YELLOW}Warning: jsonwebtoken not installed, auth will use fallback${NC}\n"
+    fi
+    # Clean up old backups (keep last 3)
+    ls -t "$CHAT_DIR/node_modules.backup."* 2>/dev/null | tail -n +4 | xargs rm -rf 2>/dev/null || true
     cd - > /dev/null
 }
 
@@ -2069,6 +2212,13 @@ PYEOF
 create_web_chat() {
     printf "${BLUE}Creating web chat files...${NC}\n"
     mkdir -p "$CHAT_DIR"
+    # Backup existing files if they exist (idempotency)
+    if [ -f "$CHAT_DIR/server.js" ]; then
+        cp "$CHAT_DIR/server.js" "$CHAT_DIR/server.js.bak.$(date +%s)" 2>/dev/null || true
+    fi
+    if [ -f "$CHAT_DIR/index.html" ]; then
+        cp "$CHAT_DIR/index.html" "$CHAT_DIR/index.html.bak.$(date +%s)" 2>/dev/null || true
+    fi
     create_server_js
     create_index_html
     printf "${GREEN}Web chat created in %s${NC}\n" "$CHAT_DIR"
@@ -2105,6 +2255,16 @@ web() {
         printf "Starting Ollama...\n"
         ollama serve > /dev/null 2>&1 &
         sleep 3
+    fi
+    # Check if port 3000 is in use
+    if command -v lsof >/dev/null 2>&1 && lsof -Pi :3000 -sTCP:LISTEN -t >/dev/null 2>&1; then
+        printf "Port 3000 busy, killing old process...\n"
+        kill -9 \$(lsof -ti :3000) 2>/dev/null || true
+        sleep 1
+    elif command -v ss >/dev/null 2>&1 && ss -tuln 2>/dev/null | grep -q ":3000 "; then
+        printf "Port 3000 busy, killing old process...\n"
+        ss -tulpn 2>/dev/null | grep ":3000 " | grep -oP 'pid=\K[0-9]+' | xargs kill -9 2>/dev/null || true
+        sleep 1
     fi
     # Cross-platform IP detection (works on WSL, Termux, HA, Linux)
     CHAT_IP=\$(ip route get 1 2>/dev/null | awk '{for(i=1;i<=NF;i++)if(\$i=="src"){print \$(i+1);exit}}' || hostname -I 2>/dev/null | awk '{print \$1}' || echo "localhost")
@@ -2190,6 +2350,12 @@ launch_choice() {
     case $ch in
         1)
             if ! pgrep -x "ollama" > /dev/null 2>&1; then ollama serve >> "$LOG_FILE" 2>&1 & sleep 3; fi
+            # Check and handle port 3000
+            if check_port 3000; then
+                printf "${YELLOW}Port 3000 is already in use. Killing existing process...${NC}\n"
+                kill_port 3000
+                sleep 1
+            fi
             printf "${GREEN}Open: http://%s:3000${NC}\n" "$CHAT_HOST"
             printf "${YELLOW}Press Ctrl+C to stop${NC}\n"
             AI_MODEL="$MODEL" node "$CHAT_DIR/server.js"

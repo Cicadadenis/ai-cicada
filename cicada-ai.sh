@@ -234,6 +234,448 @@ lifecycle_restart() {
     lifecycle_start
 }
 
+# Resource checking before installation
+check_resources() {
+    local model=$1
+    printf "${BLUE}Checking system resources...${NC}\n"
+    
+    # Get available RAM in MB
+    local ram_mb=0
+    if [ -f /proc/meminfo ]; then
+        ram_mb=$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0)
+        if [ "$ram_mb" -eq 0 ]; then
+            ram_mb=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0)
+        fi
+    elif command -v free >/dev/null 2>&1; then
+        ram_mb=$(free -m | awk '/^Mem:/{print $7}' 2>/dev/null || echo 0)
+    elif command -v vm_stat >/dev/null 2>&1; then
+        # macOS fallback
+        ram_mb=$(vm_stat | awk '/free/ {gsub(/[^0-9]/, ""); print int($1/1024)}' 2>/dev/null || echo 0)
+    fi
+    
+    # Get available disk space in GB
+    local disk_gb=0
+    disk_gb=$(df -BG "$CHAT_DIR" 2>/dev/null | awk 'NR==2 {gsub(/G/,""); print int($4)}' || df -h "$HOME" 2>/dev/null | awk 'NR==2 {print $4}' | sed 's/[A-Za-z]//g')
+    [ -z "$disk_gb" ] && disk_gb=0
+    
+    # CPU cores
+    local cpu_cores=1
+    cpu_cores=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)
+    
+    printf "  RAM: %d MB available\n" "$ram_mb"
+    printf "  Disk: %s GB available\n" "$disk_gb"
+    printf "  CPU: %d cores\n" "$cpu_cores"
+    
+    # Model requirements (approximate)
+    local min_ram=4096  # 4GB default
+    local model_size_gb=0
+    
+    case "$model" in
+        *0.5b*)  min_ram=2048;  model_size_gb=1 ;;
+        *1.5b*)  min_ram=3072;  model_size_gb=2 ;;
+        *3b*)    min_ram=4096;  model_size_gb=4 ;;
+        *7b*)    min_ram=8192;  model_size_gb=8 ;;
+        *8b*)    min_ram=8192;  model_size_gb=8 ;;
+        *13b*)   min_ram=16384; model_size_gb=15 ;;
+        *70b*)   min_ram=65536; model_size_gb=70 ;;
+        llama3.2:3b) min_ram=4096; model_size_gb=4 ;;
+        phi3:mini) min_ram=4096; model_size_gb=4 ;;
+        mistral:7b) min_ram=8192; model_size_gb=8 ;;
+        qwen2.5-coder:3b) min_ram=4096; model_size_gb=4 ;;
+        *) min_ram=4096; model_size_gb=4 ;;
+    esac
+    
+    local warnings=0
+    
+    # Check RAM
+    if [ "$ram_mb" -lt "$min_ram" ]; then
+        printf "${YELLOW}WARNING: Insufficient RAM for %s${NC}\n" "$model"
+        printf "${YELLOW}  Required: %d MB, Available: %d MB${NC}\n" "$min_ram" "$ram_mb"
+        printf "${YELLOW}  Model may run slowly or crash${NC}\n"
+        warnings=$((warnings + 1))
+    else
+        printf "${GREEN}  RAM: OK for %s${NC}\n" "$model"
+    fi
+    
+    # Check disk space (model + buffer)
+    local required_disk=$((model_size_gb + 2))
+    if [ "$disk_gb" -lt "$required_disk" ]; then
+        printf "${YELLOW}WARNING: Low disk space${NC}\n"
+        printf "${YELLOW}  Required: ~%d GB, Available: %s GB${NC}\n" "$required_disk" "$disk_gb"
+        warnings=$((warnings + 1))
+    else
+        printf "${GREEN}  Disk: OK${NC}\n"
+    fi
+    
+    # Check CPU (warning only)
+    if [ "$cpu_cores" -lt 2 ]; then
+        printf "${YELLOW}WARNING: Only %d CPU core detected${NC}\n" "$cpu_cores"
+        printf "${YELLOW}  Inference will be slow${NC}\n"
+        warnings=$((warnings + 1))
+    fi
+    
+    if [ $warnings -gt 0 ]; then
+        printf "${YELLOW}\nContinue anyway? [y/N]: ${NC}"
+        read -r confirm </dev/tty
+        case "$confirm" in
+            [Yy]*) return 0 ;;
+            *) printf "${RED}Aborted by user${NC}\n"; return 1 ;;
+        esac
+    fi
+    
+    return 0
+}
+
+# Systemd integration
+setup_systemd() {
+    if [ "$ENV_TYPE" = "termux" ] || [ "$ENV_TYPE" = "homeassistant" ] || [ "$ENV_TYPE" = "wsl-ha" ]; then
+        printf "${YELLOW}Systemd not available on this platform${NC}\n"
+        return 1
+    fi
+    
+    if ! command -v systemctl >/dev/null 2>&1; then
+        printf "${YELLOW}systemctl not available${NC}\n"
+        return 1
+    fi
+    
+    printf "${BLUE}Setting up systemd service...${NC}\n"
+    
+    # Create systemd service for AI-CICADA
+    local service_file="/etc/systemd/system/ai-cicada.service"
+    
+    # Check if we can write to systemd
+    if [ ! -w /etc/systemd/system ]; then
+        printf "${YELLOW}Need sudo to create systemd service${NC}\n"
+        printf "${YELLOW}Run: sudo systemctl enable --now ai-cicada${NC}\n"
+        return 1
+    fi
+    
+    cat > "$service_file" << EOF
+[Unit]
+Description=AI-CICADA Web Chat
+After=network.target ollama.service
+Wants=ollama.service
+
+[Service]
+Type=simple
+User=$USER
+WorkingDirectory=$CHAT_DIR
+Environment=AI_MODEL=$MODEL
+Environment=NODE_ENV=production
+Environment=JWT_SECRET=$(openssl rand -hex 32 2>/dev/null || cat /dev/urandom | tr -dc 'a-f0-9' | head -c 64)
+ExecStart=/usr/bin/node $CHAT_DIR/server.js
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    
+    systemctl daemon-reload
+    systemctl enable ai-cicada.service
+    
+    printf "${GREEN}Systemd service created: ai-cicada.service${NC}\n"
+    printf "${GREEN}  Start: sudo systemctl start ai-cicada${NC}\n"
+    printf "${GREEN}  Stop:  sudo systemctl stop ai-cicada${NC}\n"
+    printf "${GREEN}  Logs:  sudo journalctl -u ai-cicada -f${NC}\n"
+    
+    # Also create service for Ollama if not exists
+    if [ ! -f /etc/systemd/system/ollama.service ]; then
+        printf "${YELLOW}Consider installing Ollama systemd service:${NC}\n"
+        printf "${YELLOW}  sudo systemctl enable --now ollama${NC}\n"
+    fi
+    
+    return 0
+}
+
+# Full CLI command dispatcher
+cicada_cli() {
+    local cmd="${1:-help}"
+    shift || true
+    
+    case "$cmd" in
+        install)
+            printf "${CYAN}AI-CICADA Installer v%s${NC}\n" "$SCRIPT_VERSION"
+            cicada_do_install
+            ;;
+        start)
+            lifecycle_start
+            ;;
+        stop)
+            lifecycle_stop
+            ;;
+        restart)
+            lifecycle_restart
+            ;;
+        status)
+            lifecycle_status
+            ;;
+        remove|uninstall)
+            cicada_do_remove
+            ;;
+        systemd)
+            setup_systemd
+            ;;
+        logs)
+            cicada_logs
+            ;;
+        doctor)
+            cicada_doctor
+            ;;
+        help|--help|-h|*)
+            cat << 'HELPEOF'
+AI-CICADA - Local AI Chat with JWT Auth
+
+Usage: ./33.sh <command> [options]
+
+Commands:
+  install       Run full installation (interactive)
+  start         Start web server and dependencies
+  stop          Stop all AI-CICADA services
+  restart       Restart services
+  status        Show service status and health
+  remove        Uninstall AI-CICADA
+  systemd       Setup systemd service (auto-start)
+  logs          View service logs
+  doctor        Diagnose common issues
+  help          Show this help
+
+Examples:
+  ./33.sh install          # First time setup
+  ./33.sh start            # Start the web chat
+  ./33.sh status           # Check if running
+  ./33.sh systemd          # Enable auto-start
+
+Files:
+  Install dir: ~/.ai-cicada/
+  Database:    ~/.ai-cicada/cicada.db
+  Logs:        ~/ollama_install.log
+  State:       ~/.ai-cicada/.install_state
+HELPEOF
+            ;;
+    esac
+}
+
+# Actual installation logic (extracted from main)
+cicada_do_install() {
+    # Check resources first
+    if ! check_resources "${1:-qwen2.5-coder:3b}"; then
+        printf "${RED}Installation aborted${NC}\n"
+        return 1
+    fi
+    
+    # Acquire lock
+    if ! acquire_lock; then
+        exit 1
+    fi
+    
+    # Cleanup on exit
+    trap 'release_lock; exit' INT TERM EXIT
+    
+    echo "===== AI-CICADA INSTALL $(date) =====" > "$LOG_FILE"
+    detect_env
+    init_state
+    
+    # Check if already installed
+    local prev_install
+    prev_install=$(get_state "script_version")
+    if [ -n "$prev_install" ]; then
+        printf "${YELLOW}Previous installation detected (version: %s)${NC}\n" "$prev_install"
+        printf "${YELLOW}This will update/overwrite existing files${NC}\n"
+        printf "${YELLOW}Press any key to continue or Ctrl+C to cancel...${NC}\n"
+        read -r -n1 </dev/tty || true
+        printf "\n"
+    fi
+    
+    show_logo
+    select_backend
+    update_system; clear
+    install_nodejs; printf "\n"
+    install_sqlite_tools; printf "\n"
+
+    if [ "$BACKEND" = "llamacpp" ]; then
+        select_llama_model
+        install_llama; printf "\n"
+        download_llama_model; printf "\n"
+        install_npm_deps; printf "\n"
+        create_web_chat; printf "\n"
+        setup_alias; printf "\n"
+        show_ha_tips
+        final_screen
+        clear
+        center_text "${YELLOW}What to launch now?${NC}"
+        printf "\n"
+        draw_box "1) Browser chat (web via llama.cpp)" "2) Exit"
+        printf "\n${YELLOW}Choice: ${NC}"
+        read -r ch </dev/tty
+        case $ch in
+            1) launch_llamacpp ;;
+            *) printf "${GREEN}Done! Run 'web' anytime after starting llama-server.${NC}\n" ;;
+        esac
+    else
+        select_model
+        install_ollama; printf "\n"
+        start_ollama_service
+        install_model; clear
+        install_npm_deps; printf "\n"
+        create_web_chat; printf "\n"
+        setup_alias; printf "\n"
+        show_ha_tips
+        final_screen
+        launch_choice
+    fi
+    
+    # Save installation state
+    set_state "script_version" "$SCRIPT_VERSION"
+    set_state "install_date" "$(date -Iseconds 2>/dev/null || date +%Y-%m-%dT%H:%M:%S)"
+    set_state "platform" "$ENV_TYPE"
+    set_state "backend" "$BACKEND"
+    set_state "model" "$MODEL"
+    
+    # Release lock
+    release_lock
+    trap - INT TERM EXIT
+    
+    printf "${GREEN}\nInstallation complete!${NC}\n"
+    printf "${GREEN}Run 'cicada start' or './33.sh start' to begin${NC}\n"
+}
+
+# Uninstall function
+cicada_do_remove() {
+    printf "${YELLOW}This will remove AI-CICADA and all data!${NC}\n"
+    printf "${YELLOW}Database at %s will be DELETED${NC}\n" "$CHAT_DIR"
+    printf "${YELLOW}Are you sure? [yes/no]: ${NC}"
+    read -r confirm
+    if [ "$confirm" != "yes" ]; then
+        printf "${GREEN}Aborted${NC}\n"
+        return 0
+    fi
+    
+    printf "${BLUE}Stopping services...${NC}\n"
+    lifecycle_stop
+    pkill -f "ollama" 2>/dev/null || true
+    
+    printf "${BLUE}Removing files...${NC}\n"
+    rm -rf "$CHAT_DIR"
+    rm -f /tmp/ai-cicada-install.lock
+    
+    # Remove from shell rc
+    local SHELLRC="$HOME/.bashrc"
+    if [ -f "$HOME/.bashrc" ]; then
+        sed -i '/# AI-CICADA/,/# END AI-CICADA/d' "$SHELLRC" 2>/dev/null || true
+    fi
+    
+    # Remove systemd service if exists
+    if [ -f /etc/systemd/system/ai-cicada.service ]; then
+        systemctl stop ai-cicada 2>/dev/null || true
+        systemctl disable ai-cicada 2>/dev/null || true
+        rm -f /etc/systemd/system/ai-cicada.service
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+    
+    printf "${GREEN}AI-CICADA removed${NC}\n"
+}
+
+# View logs
+cicada_logs() {
+    printf "${CYAN}Recent logs:${NC}\n"
+    if [ -f "$LOG_FILE" ]; then
+        tail -50 "$LOG_FILE"
+    fi
+    
+    # Try journalctl if available
+    if command -v journalctl >/dev/null 2>&1 && systemctl is-active ai-cicada >/dev/null 2>&1; then
+        printf "${CYAN}\nSystemd service logs:${NC}\n"
+        journalctl -u ai-cicada -n 20 --no-pager 2>/dev/null || true
+    fi
+}
+
+# Diagnostic function
+cicada_doctor() {
+    printf "${CYAN}AI-CICADA Diagnostics${NC}\n\n"
+    
+    local issues=0
+    
+    # Check 1: Node.js
+    printf "1. Node.js... "
+    if command -v node >/dev/null 2>&1; then
+        printf "${GREEN}%s${NC}\n" "$(node --version)"
+    else
+        printf "${RED}NOT FOUND${NC}\n"
+        issues=$((issues + 1))
+    fi
+    
+    # Check 2: Ollama
+    printf "2. Ollama... "
+    if command -v ollama >/dev/null 2>&1; then
+        printf "${GREEN}installed${NC}"
+        if pgrep -x "ollama" >/dev/null 2>&1; then
+            printf " ${GREEN}(running)${NC}\n"
+        else
+            printf " ${YELLOW}(stopped)${NC}\n"
+        fi
+    else
+        printf "${RED}NOT FOUND${NC}\n"
+        issues=$((issues + 1))
+    fi
+    
+    # Check 3: Dependencies
+    printf "3. Dependencies... "
+    if [ -d "$CHAT_DIR/node_modules/better-sqlite3" ]; then
+        printf "${GREEN}OK${NC}\n"
+    else
+        printf "${YELLOW}incomplete (will use fallback)${NC}\n"
+    fi
+    
+    # Check 4: Database
+    printf "4. Database... "
+    if [ -f "$CHAT_DIR/cicada.db" ]; then
+        local size
+        size=$(stat -f%z "$CHAT_DIR/cicada.db" 2>/dev/null || stat -c%s "$CHAT_DIR/cicada.db" 2>/dev/null || echo 0)
+        printf "${GREEN}exists (%s bytes)${NC}\n" "$size"
+    else
+        printf "${YELLOW}not created yet${NC}\n"
+    fi
+    
+    # Check 5: Ports
+    printf "5. Port 3000... "
+    if check_port 3000; then
+        printf "${YELLOW}in use${NC}\n"
+        issues=$((issues + 1))
+    else
+        printf "${GREEN}available${NC}\n"
+    fi
+    
+    printf "6. Port 11434... "
+    if check_port 11434; then
+        printf "${GREEN}Ollama listening${NC}\n"
+    else
+        printf "${YELLOW}not in use${NC}\n"
+    fi
+    
+    # Check 6: Systemd
+    printf "7. Systemd service... "
+    if [ -f /etc/systemd/system/ai-cicada.service ]; then
+        if systemctl is-enabled ai-cicada >/dev/null 2>&1; then
+            printf "${GREEN}enabled${NC}\n"
+        else
+            printf "${YELLOW}created but not enabled${NC}\n"
+        fi
+    else
+        printf "${YELLOW}not set up${NC}\n"
+    fi
+    
+    printf "\n"
+    if [ $issues -eq 0 ]; then
+        printf "${GREEN}All checks passed!${NC}\n"
+    else
+        printf "${YELLOW}%d issue(s) found${NC}\n" "$issues"
+        printf "${YELLOW}Run './33.sh install' to fix${NC}\n"
+    fi
+}
+
 detect_wsl() {
     # Check for WSL using multiple methods
     if [ -f /proc/sys/kernel/osrelease ] && grep -qi "microsoft\|wsl" /proc/sys/kernel/osrelease 2>/dev/null; then
@@ -2630,85 +3072,8 @@ launch_choice() {
 }
 
 main() {
-    # Handle lifecycle commands
-    case "${1:-}" in
-        start)   lifecycle_start; exit 0 ;;
-        stop)    lifecycle_stop; exit 0 ;;
-        restart) lifecycle_restart; exit 0 ;;
-        status)  lifecycle_status; exit 0 ;;
-    esac
-    
-    # Acquire lock to prevent duplicate installations
-    if ! acquire_lock; then
-        exit 1
-    fi
-    
-    # Cleanup on exit
-    trap 'release_lock; exit' INT TERM EXIT
-    
-    echo "===== AI-CICADA INSTALL $(date) =====" > "$LOG_FILE"
-    detect_env
-    init_state
-    
-    # Check if already installed
-    local prev_install
-    prev_install=$(get_state "script_version")
-    if [ -n "$prev_install" ]; then
-        printf "${YELLOW}Previous installation detected (version: %s)${NC}\n" "$prev_install"
-        printf "${YELLOW}This will update/overwrite existing files${NC}\n"
-        printf "${YELLOW}Press any key to continue or Ctrl+C to cancel...${NC}\n"
-        read -r -n1 </dev/tty || true
-        printf "\n"
-    fi
-    
-    show_logo
-    select_backend
-    update_system; clear
-    install_nodejs; printf "\n"
-    install_sqlite_tools; printf "\n"
-
-    if [ "$BACKEND" = "llamacpp" ]; then
-        select_llama_model
-        install_llama; printf "\n"
-        download_llama_model; printf "\n"
-        install_npm_deps; printf "\n"
-        create_web_chat; printf "\n"
-        setup_alias; printf "\n"
-        show_ha_tips
-        final_screen
-        clear
-        center_text "${YELLOW}What to launch now?${NC}"
-        printf "\n"
-        draw_box "1) Browser chat (web via llama.cpp)" "2) Exit"
-        printf "\n${YELLOW}Choice: ${NC}"
-        read -r ch </dev/tty
-        case $ch in
-            1) launch_llamacpp ;;
-            *) printf "${GREEN}Done! Run 'web' anytime after starting llama-server.${NC}\n" ;;
-        esac
-    else
-        select_model
-        install_ollama; printf "\n"
-        start_ollama_service
-        install_model; clear
-        install_npm_deps; printf "\n"
-        create_web_chat; printf "\n"
-        setup_alias; printf "\n"
-        show_ha_tips
-        final_screen
-        launch_choice
-    fi
-    
-    # Save installation state
-    set_state "script_version" "$SCRIPT_VERSION"
-    set_state "install_date" "$(date -Iseconds 2>/dev/null || date +%Y-%m-%dT%H:%M:%S)"
-    set_state "platform" "$ENV_TYPE"
-    set_state "backend" "$BACKEND"
-    set_state "model" "$MODEL"
-    
-    # Release lock
-    release_lock
-    trap - INT TERM EXIT
+    # Delegate to CLI dispatcher
+    cicada_cli "$@"
 }
 
 main "$@"

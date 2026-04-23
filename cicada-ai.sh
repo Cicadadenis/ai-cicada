@@ -38,6 +38,202 @@ kill_port() {
     fi
 }
 
+# State management for tracking installed components
+STATE_FILE="$CHAT_DIR/.install_state"
+SCRIPT_VERSION="5.1.0"
+
+init_state() {
+    mkdir -p "$CHAT_DIR"
+    if [ ! -f "$STATE_FILE" ]; then
+        echo "{}" > "$STATE_FILE"
+    fi
+}
+
+get_state() {
+    local key=$1
+    if [ -f "$STATE_FILE" ]; then
+        cat "$STATE_FILE" | grep -oP '"'$key'":\s*"\K[^"]+' 2>/dev/null || echo ""
+    fi
+}
+
+set_state() {
+    local key=$1
+    local value=$2
+    init_state
+    local tmp_file="${STATE_FILE}.tmp"
+    if [ -s "$STATE_FILE" ] && [ "$(cat "$STATE_FILE")" != "{}" ]; then
+        # Update existing key
+        if grep -q "\"$key\":" "$STATE_FILE"; then
+            sed 's/"'$key'": "[^"]*"/"'$key'": "'$value'"/' "$STATE_FILE" > "$tmp_file"
+        else
+            # Add new key
+            sed 's/}$/, "'$key'": "'$value'"}/' "$STATE_FILE" > "$tmp_file"
+        fi
+    else
+        # Create new state
+        echo "{ \"$key\": \"$value\" }" > "$tmp_file"
+    fi
+    mv "$tmp_file" "$STATE_FILE"
+}
+
+# Download verification with checksum and size check
+verify_download() {
+    local file=$1
+    local min_size=${2:-1000}  # minimum size in bytes (default 1KB)
+    
+    if [ ! -f "$file" ]; then
+        printf "${RED}Download failed: file not found %s${NC}\n" "$file"
+        return 1
+    fi
+    
+    local size
+    size=$(stat -f%z "$file" 2>/dev/null || stat -c%s "$file" 2>/dev/null || echo 0)
+    if [ "$size" -lt "$min_size" ]; then
+        printf "${RED}Download incomplete: %s is only %s bytes${NC}\n" "$file" "$size"
+        rm -f "$file"
+        return 1
+    fi
+    
+    # Check if file looks like HTML error page (common issue)
+    if head -1 "$file" | grep -qi "^<!DOCTYPE\|^<html\|^<HTML"; then
+        printf "${RED}Download failed: received HTML error page instead of file${NC}\n"
+        rm -f "$file"
+        return 1
+    fi
+    
+    return 0
+}
+
+# Process lock to prevent duplicate runs
+LOCK_FILE="/tmp/ai-cicada-install.lock"
+acquire_lock() {
+    if [ -f "$LOCK_FILE" ]; then
+        local old_pid
+        old_pid=$(cat "$LOCK_FILE" 2>/dev/null)
+        if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+            printf "${RED}Another installation is already running (PID: %s)${NC}\n" "$old_pid"
+            return 1
+        fi
+    fi
+    echo $$ > "$LOCK_FILE"
+    return 0
+}
+
+release_lock() {
+    rm -f "$LOCK_FILE"
+}
+
+# Lifecycle commands
+lifecycle_start() {
+    printf "${BLUE}Starting AI-CICADA services...${NC}\n"
+    
+    # Start Ollama if not running
+    if ! pgrep -x "ollama" > /dev/null 2>&1; then
+        printf "${YELLOW}Starting Ollama...${NC}\n"
+        ollama serve >> "$LOG_FILE" 2>&1 &
+        sleep 3
+    fi
+    
+    # Check port 3000
+    if check_port 3000; then
+        printf "${YELLOW}Port 3000 busy, killing old process...${NC}\n"
+        kill_port 3000
+        sleep 1
+    fi
+    
+    local CHAT_HOST
+    CHAT_HOST=$(ip route get 1 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="src"){print $(i+1);exit}}' || hostname -I 2>/dev/null | awk '{print $1}' || echo "localhost")
+    printf "${GREEN}Web chat: http://%s:3000${NC}\n" "$CHAT_HOST"
+    printf "${YELLOW}Press Ctrl+C to stop${NC}\n"
+    
+    AI_MODEL="$MODEL" node "$CHAT_DIR/server.js"
+}
+
+lifecycle_stop() {
+    printf "${BLUE}Stopping AI-CICADA services...${NC}\n"
+    
+    local killed=0
+    
+    # Stop node server
+    local node_pids
+    node_pids=$(pgrep -f "node.*server.js" 2>/dev/null)
+    if [ -n "$node_pids" ]; then
+        echo "$node_pids" | xargs kill -9 2>/dev/null || true
+        killed=$((killed + 1))
+    fi
+    
+    # Stop llama-server
+    if pgrep -f "llama-server" > /dev/null 2>&1; then
+        pkill -f "llama-server" 2>/dev/null || true
+        killed=$((killed + 1))
+    fi
+    
+    # Kill processes on ports
+    kill_port 3000
+    kill_port 8080
+    
+    if [ $killed -gt 0 ]; then
+        printf "${GREEN}Services stopped${NC}\n"
+    else
+        printf "${YELLOW}No running services found${NC}\n"
+    fi
+}
+
+lifecycle_status() {
+    printf "${CYAN}AI-CICADA Status:${NC}\n"
+    printf "  Script version: %s\n" "$SCRIPT_VERSION"
+    printf "  Install dir: %s\n" "$CHAT_DIR"
+    
+    # Check state
+    local install_date
+    install_date=$(get_state "install_date")
+    if [ -n "$install_date" ]; then
+        printf "  Installed: %s\n" "$install_date"
+    fi
+    
+    # Check Ollama
+    if pgrep -x "ollama" > /dev/null 2>&1; then
+        printf "  Ollama: ${GREEN}running${NC}\n"
+    else
+        printf "  Ollama: ${RED}stopped${NC}\n"
+    fi
+    
+    # Check web server
+    if pgrep -f "node.*server.js" > /dev/null 2>&1; then
+        local pid
+        pid=$(pgrep -f "node.*server.js" | head -1)
+        printf "  Web server: ${GREEN}running (PID: %s)${NC}\n" "$pid"
+    else
+        printf "  Web server: ${RED}stopped${NC}\n"
+    fi
+    
+    # Check llama-server
+    if pgrep -f "llama-server" > /dev/null 2>&1; then
+        printf "  llama.cpp: ${GREEN}running${NC}\n"
+    else
+        printf "  llama.cpp: ${RED}stopped${NC}\n"
+    fi
+    
+    # Check ports
+    if check_port 3000; then
+        printf "  Port 3000: ${YELLOW}in use${NC}\n"
+    else
+        printf "  Port 3000: ${GREEN}available${NC}\n"
+    fi
+    
+    if check_port 11434; then
+        printf "  Port 11434: ${YELLOW}in use (Ollama)${NC}\n"
+    else
+        printf "  Port 11434: ${RED}available${NC}\n"
+    fi
+}
+
+lifecycle_restart() {
+    lifecycle_stop
+    sleep 2
+    lifecycle_start
+}
+
 detect_wsl() {
     # Check for WSL using multiple methods
     if [ -f /proc/sys/kernel/osrelease ] && grep -qi "microsoft\|wsl" /proc/sys/kernel/osrelease 2>/dev/null; then
@@ -416,21 +612,43 @@ download_llama_model() {
     mkdir -p "$MODEL_DIR"
     if [ -f "$LLAMA_MODEL_PATH" ]; then
         printf "${GREEN}Model already downloaded: %s${NC}\n" "$LLAMA_MODEL_FILE"
-        return
+        return 0
     fi
     printf "${BLUE}Downloading model (~400MB-2GB)...${NC}\n"
     timer_start
-    if command -v wget >/dev/null 2>&1; then
-        wget -q --show-progress -O "$LLAMA_MODEL_PATH" "$LLAMA_MODEL_URL" 2>&1 | tee -a "$LOG_FILE"
-    elif command -v curl >/dev/null 2>&1; then
-        curl -L --progress-bar -o "$LLAMA_MODEL_PATH" "$LLAMA_MODEL_URL" 2>&1 | tee -a "$LOG_FILE"
-    else
-        printf "${RED}No wget or curl found. Cannot download model.${NC}\n"
-        exit 1
-    fi
-    timer_end
-    printf "${GREEN}Model downloaded: %s${NC}\n" "$LLAMA_MODEL_PATH"
-    log "llama.cpp model downloaded: $LLAMA_MODEL_PATH"
+    local attempt=0
+    local max_attempts=3
+    while [ $attempt -lt $max_attempts ]; do
+        attempt=$((attempt + 1))
+        printf "${YELLOW}Attempt %d/%d...${NC}\n" "$attempt" "$max_attempts"
+        
+        if command -v wget >/dev/null 2>&1; then
+            wget -q --show-progress -O "$LLAMA_MODEL_PATH.tmp" "$LLAMA_MODEL_URL" 2>&1 | tee -a "$LOG_FILE"
+        elif command -v curl >/dev/null 2>&1; then
+            curl -L --progress-bar -o "$LLAMA_MODEL_PATH.tmp" "$LLAMA_MODEL_URL" 2>&1 | tee -a "$LOG_FILE"
+        else
+            printf "${RED}No wget or curl found. Cannot download model.${NC}\n"
+            return 1
+        fi
+        
+        # Verify download (models should be at least 100MB)
+        if verify_download "$LLAMA_MODEL_PATH.tmp" 104857600; then
+            mv "$LLAMA_MODEL_PATH.tmp" "$LLAMA_MODEL_PATH"
+            timer_end
+            printf "${GREEN}Model downloaded: %s${NC}\n" "$LLAMA_MODEL_PATH"
+            log "llama.cpp model downloaded: $LLAMA_MODEL_PATH"
+            return 0
+        fi
+        
+        rm -f "$LLAMA_MODEL_PATH.tmp"
+        if [ $attempt -lt $max_attempts ]; then
+            printf "${YELLOW}Retrying in 5 seconds...${NC}\n"
+            sleep 5
+        fi
+    done
+    
+    printf "${RED}Failed to download model after %d attempts${NC}\n" "$max_attempts"
+    return 1
 }
 
 PORT_LLAMA=8080
@@ -621,16 +839,15 @@ install_ollama() {
                     printf "${RED}Failed to download Ollama installer${NC}\n"
                     return 1
                 fi
-                if [ -f "$INSTALLER" ] && [ -s "$INSTALLER" ]; then
-                    chmod +x "$INSTALLER"
-                    proot-distro login ubuntu -- "$INSTALLER" >> "$LOG_FILE" 2>&1 & install_pid=$!
-                    spinner $install_pid
-                    wait $install_pid || exit_code=$?
-                    rm -f "$INSTALLER"
-                else
-                    printf "${RED}Failed to download Ollama installer${NC}\n"
+                if ! verify_download "$INSTALLER" 1000; then
+                    printf "${RED}Ollama installer download verification failed${NC}\n"
                     return 1
                 fi
+                chmod +x "$INSTALLER"
+                proot-distro login ubuntu -- "$INSTALLER" >> "$LOG_FILE" 2>&1 & install_pid=$!
+                spinner $install_pid
+                wait $install_pid || exit_code=$?
+                rm -f "$INSTALLER"
                 printf '#!/bin/sh\nproot-distro login ubuntu -- ollama "$@"\n' > "$PREFIX/bin/ollama"
                 chmod +x "$PREFIX/bin/ollama"
             fi
@@ -660,16 +877,15 @@ install_ollama() {
                 printf "${RED}Failed to download Ollama installer${NC}\n"
                 return 1
             fi
-            if [ -f "$INSTALLER" ] && [ -s "$INSTALLER" ]; then
-                chmod +x "$INSTALLER"
-                "$INSTALLER" >> "$LOG_FILE" 2>&1 & install_pid=$!
-                spinner $install_pid
-                wait $install_pid || exit_code=$?
-                rm -f "$INSTALLER"
-            else
-                printf "${RED}Failed to download Ollama installer${NC}\n"
+            if ! verify_download "$INSTALLER" 1000; then
+                printf "${RED}Ollama installer download verification failed${NC}\n"
                 return 1
             fi
+            chmod +x "$INSTALLER"
+            "$INSTALLER" >> "$LOG_FILE" 2>&1 & install_pid=$!
+            spinner $install_pid
+            wait $install_pid || exit_code=$?
+            rm -f "$INSTALLER"
             ;;
         *)
             local INSTALLER="/tmp/ollama_install_$$.sh"
@@ -677,16 +893,15 @@ install_ollama() {
                 printf "${RED}Failed to download Ollama installer${NC}\n"
                 return 1
             fi
-            if [ -f "$INSTALLER" ] && [ -s "$INSTALLER" ]; then
-                chmod +x "$INSTALLER"
-                "$INSTALLER" >> "$LOG_FILE" 2>&1 & install_pid=$!
-                spinner $install_pid
-                wait $install_pid || exit_code=$?
-                rm -f "$INSTALLER"
-            else
-                printf "${RED}Failed to download Ollama installer${NC}\n"
+            if ! verify_download "$INSTALLER" 1000; then
+                printf "${RED}Ollama installer download verification failed${NC}\n"
                 return 1
             fi
+            chmod +x "$INSTALLER"
+            "$INSTALLER" >> "$LOG_FILE" 2>&1 & install_pid=$!
+            spinner $install_pid
+            wait $install_pid || exit_code=$?
+            rm -f "$INSTALLER"
             ;;
     esac
     timer_end
@@ -2278,9 +2493,50 @@ aidb() {
         sqlite3 "\$AI_CICADA_DIR/cicada.db" "SELECT username, total_msgs, datetime(created_at,'unixepoch') as reg FROM users;"
     fi
 }
+
+aicada() {
+    case "\$1" in
+        start)
+            printf "Starting AI-CICADA...\n"
+            if ! pgrep -x "ollama" > /dev/null 2>&1; then
+                ollama serve > /dev/null 2>&1 &
+                sleep 3
+            fi
+            if command -v lsof >/dev/null 2>&1 && lsof -Pi :3000 -sTCP:LISTEN -t >/dev/null 2>&1; then
+                kill -9 \$(lsof -ti :3000) 2>/dev/null || true
+                sleep 1
+            fi
+            CHAT_IP=\$(ip route get 1 2>/dev/null | awk '{for(i=1;i<=NF;i++)if(\$i=="src"){print \$(i+1);exit}}' || hostname -I 2>/dev/null | awk '{print \$1}' || echo "localhost")
+            printf "Web: http://\${CHAT_IP}:3000\n"
+            AI_MODEL=\$AI_MODEL node \$AI_CICADA_DIR/server.js
+            ;;
+        stop)
+            printf "Stopping AI-CICADA...\n"
+            pkill -f "node.*server.js" 2>/dev/null || true
+            pkill -f "llama-server" 2>/dev/null || true
+            kill -9 \$(lsof -ti :3000) 2>/dev/null || true
+            printf "Stopped\n"
+            ;;
+        restart)
+            aicada stop
+            sleep 2
+            aicada start
+            ;;
+        status)
+            printf "AI-CICADA Status:\n"
+            if pgrep -x "ollama" > /dev/null 2>&1; then printf "  Ollama: running\n"; else printf "  Ollama: stopped\n"; fi
+            if pgrep -f "node.*server.js" > /dev/null 2>&1; then printf "  Web: running (PID: \$(pgrep -f node.*server.js | head -1))\n"; else printf "  Web: stopped\n"; fi
+            if command -v lsof >/dev/null 2>&1 && lsof -Pi :3000 -sTCP:LISTEN -t >/dev/null 2>&1; then printf "  Port 3000: in use\n"; else printf "  Port 3000: available\n"; fi
+            ;;
+        *)
+            printf "Usage: aicada {start|stop|restart|status}\n"
+            ;;
+    esac
+}
 # END AI-CICADA
 ALIASEOF
-    printf "${GREEN}Commands ready: 'ai', 'web', 'aidb'${NC}\n"
+    printf "${GREEN}Commands ready: 'ai', 'web', 'aidb', 'aicada'${NC}\n"
+    printf "${GREEN}  aicada start|stop|restart|status${NC}\n"
 }
 
 show_ha_tips() {
@@ -2325,10 +2581,15 @@ final_screen() {
         "Platform : $display_env" \
         "Model    : $MODEL" \
         "DB       : $CHAT_DIR/cicada.db" \
+        "Version  : $SCRIPT_VERSION" \
         "" \
-        "  web   -- http://${CHAT_HOST}:3000" \
-        "  ai    -- terminal agent" \
-        "  aidb  -- view database" \
+        "Commands:" \
+        "  aicada start   -- start services" \
+        "  aicada stop    -- stop services" \
+        "  aicada status  -- check status" \
+        "  web            -- http://${CHAT_HOST}:3000" \
+        "  ai             -- terminal agent" \
+        "  aidb           -- view database" \
         "" \
         "Log: $LOG_FILE"
     printf "\n"
@@ -2369,8 +2630,37 @@ launch_choice() {
 }
 
 main() {
+    # Handle lifecycle commands
+    case "${1:-}" in
+        start)   lifecycle_start; exit 0 ;;
+        stop)    lifecycle_stop; exit 0 ;;
+        restart) lifecycle_restart; exit 0 ;;
+        status)  lifecycle_status; exit 0 ;;
+    esac
+    
+    # Acquire lock to prevent duplicate installations
+    if ! acquire_lock; then
+        exit 1
+    fi
+    
+    # Cleanup on exit
+    trap 'release_lock; exit' INT TERM EXIT
+    
     echo "===== AI-CICADA INSTALL $(date) =====" > "$LOG_FILE"
     detect_env
+    init_state
+    
+    # Check if already installed
+    local prev_install
+    prev_install=$(get_state "script_version")
+    if [ -n "$prev_install" ]; then
+        printf "${YELLOW}Previous installation detected (version: %s)${NC}\n" "$prev_install"
+        printf "${YELLOW}This will update/overwrite existing files${NC}\n"
+        printf "${YELLOW}Press any key to continue or Ctrl+C to cancel...${NC}\n"
+        read -r -n1 </dev/tty || true
+        printf "\n"
+    fi
+    
     show_logo
     select_backend
     update_system; clear
@@ -2408,6 +2698,17 @@ main() {
         final_screen
         launch_choice
     fi
+    
+    # Save installation state
+    set_state "script_version" "$SCRIPT_VERSION"
+    set_state "install_date" "$(date -Iseconds 2>/dev/null || date +%Y-%m-%dT%H:%M:%S)"
+    set_state "platform" "$ENV_TYPE"
+    set_state "backend" "$BACKEND"
+    set_state "model" "$MODEL"
+    
+    # Release lock
+    release_lock
+    trap - INT TERM EXIT
 }
 
 main "$@"
